@@ -1,0 +1,56 @@
+name: Build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: devkitpro/devkita64:latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+
+      - name: Install latest libnx (before building)
+        run: |
+          pushd /tmp
+          git clone https://github.com/switchbrew/libnx
+          cd libnx
+          make clean
+          make -j8 PREFIX="ccache aarch64-none-elf-"
+          make install
+          popd
+
+      - name: Clear invalid ccache after libnx update 
+        run: ccache -C
+
+      - name: Build
+        run: make -j8 PREFIX="ccache aarch64-none-elf-"
+
+      - name: Upload built files
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdcard
+          path: out/sd
+
+      - name: Upload elf file
+        uses: actions/upload-artifact@v7
+        with:
+          name: ldn_mitm.elf
+          path: ldn_mitm/ldn_mitm.elf
+
+      - name: Upload elf file
+        uses: actions/upload-artifact@v7
+        with:
+          name: overlay.elf
+          path: overlay/overlay.elf

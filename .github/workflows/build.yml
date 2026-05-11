@@ -1,0 +1,65 @@
+name: Build
+
+on: [push]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: install dependencies
+      run: sudo apt install -y libpcap-dev
+    - name: make
+      run: |
+        mkdir build
+        cd build
+        cmake ..
+        make
+    - name: upload built files
+      uses: actions/upload-artifact@v4
+      with:
+        name: lan-play-linux
+        path: build/src/lan-play
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Setup msbuild.exe
+      uses: microsoft/setup-msbuild@v1.1
+    - name: make
+      run: |
+        mkdir build
+        cd build
+        cmake ..
+        msbuild SwitchLanPlay.sln
+
+    - name: upload built files
+      uses: actions/upload-artifact@v4
+      with:
+        name: lan-play-windows
+        path: build/src/Debug/lan-play.exe
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: make
+      run: |
+        mkdir build
+        cd build
+        cmake ..
+        make
+
+    - name: upload built files
+      uses: actions/upload-artifact@v4
+      with:
+        name: lan-play-macos
+        path: build/src/lan-play

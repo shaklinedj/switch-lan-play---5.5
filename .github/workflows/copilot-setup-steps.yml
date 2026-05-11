@@ -1,0 +1,32 @@
+name: "Copilot Setup Steps"
+
+on:
+    workflow_dispatch:
+    push:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+    pull_request:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+    copilot-setup-steps:
+        runs-on: ubuntu-latest
+
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - name: Install system dependencies
+              run: sudo apt-get install -y libpcap-dev
+
+            - name: Install mise
+              uses: jdx/mise-action@v2
+
+            - name: Install cmake and ninja via mise
+              run: mise install cmake ninja

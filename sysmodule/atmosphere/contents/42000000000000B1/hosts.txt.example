@@ -1,0 +1,6 @@
+# Local DNS fallback for switch-lan-play sysmodule
+# Format: <ipv4> <hostname>
+# Example:
+# 192.241.238.136 tekn0.net
+
+192.241.238.136 tekn0.net

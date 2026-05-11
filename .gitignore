@@ -1,0 +1,24 @@
+.idea
+build/
+build-*/
+.vs/
+CMakeSettings.json
+.vscode
+.DS_Store
+run.sh
+debug.sh
+memcheck.sh
+valgrind_ignore
+yarn.lock
+
+# Exclude original zip (we have the modified source in ldn_mitm-1.25.1/)
+ldn_mitm-master.zip
+
+# Node modules
+node_modules/
+server/node_modules/
+
+# Build artifacts
+*.elf
+*.lst
+*.d
