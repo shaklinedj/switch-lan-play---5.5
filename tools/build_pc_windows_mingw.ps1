@@ -26,7 +26,7 @@ catch {
 }
 
 Write-Host "Configurando proyecto en $BuildDir ($Config)..." -ForegroundColor Cyan
-cmake -S . -B $BuildDir -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=$Config
+cmake -S . -B $BuildDir -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=$Config -DBUILD_TESTING=OFF
 
 Write-Host "Compilando..." -ForegroundColor Cyan
 cmake --build $BuildDir --config $Config -j 4
