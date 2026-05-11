@@ -124,7 +124,7 @@ static void gate_process_request(bool *close_session)
     HipcParsedRequest hipc = hipcParseRequest(armGetTls());
 
     if (hipc.meta.type == CmifCommandType_Close) {
-        gate_make_response(ResultSuccess(), NULL, 0);
+        gate_make_response(0, NULL, 0);
         *close_session = true;
         return;
     }
@@ -161,20 +161,20 @@ static void gate_process_request(bool *close_session)
              (unsigned long long)snapshot.local_communication_id,
              snapshot.scene_id);
 
-        gate_make_response(ResultSuccess(), NULL, 0);
+        gate_make_response(0, NULL, 0);
         break;
     }
     case LANP_GATE_CMD_GET_STATE: {
         lanp_gate_state_t st;
         ldn_gate_get_state(&st);
-        gate_make_response(ResultSuccess(), &st, sizeof(st));
+        gate_make_response(0, &st, sizeof(st));
         break;
     }
     case LANP_GATE_CMD_CLEAR: {
         if (g_gate_mutex_ready) mutexLock(&g_gate_mutex);
         gate_reset_state_locked();
         if (g_gate_mutex_ready) mutexUnlock(&g_gate_mutex);
-        gate_make_response(ResultSuccess(), NULL, 0);
+        gate_make_response(0, NULL, 0);
         break;
     }
     default:
@@ -236,7 +236,7 @@ static void gate_server_thread_fn(void *arg)
 
 Result ldn_gate_service_init(void)
 {
-    if (g_gate_registered) return ResultSuccess();
+    if (g_gate_registered) return 0;
 
     mutexInit(&g_gate_mutex);
     g_gate_mutex_ready = true;
@@ -267,7 +267,7 @@ Result ldn_gate_service_init(void)
     g_gate_thread_started = true;
     g_gate_registered = true;
     LLOG(LLOG_INFO, "ldn_gate: service %s registered", LANP_GATE_SERVICE_NAME);
-    return ResultSuccess();
+    return 0;
 }
 
 void ldn_gate_service_exit(void)
