@@ -12,6 +12,7 @@ namespace ams::mitm::ldn {
 
     const char *LANDiscovery::FakeSsid = "12345678123456781234567812345678";
     const LANDiscovery::LanEventFunc LANDiscovery::EmptyFunc = [](){};
+    const LANDiscovery::StateChangeFunc LANDiscovery::EmptyStateChangeFunc = [](CommState, CommState){};
 
     static bool scanFilterMatchesNetwork(const ScanFilter *filter, const NetworkInfo *info) {
         if (!filter || !info) {
@@ -344,22 +345,29 @@ namespace ams::mitm::ldn {
         }
         fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) {
+            LogFormat("initUdp: socket() failed fd=%d", fd);
             return MAKERESULT(ModuleID, 1);
         }
+        LogFormat("initUdp: socket created fd=%d listening=%d port=%u", fd, listening, listenPort);
         auto udpSocket = std::make_unique<LDUdpSocket>(fd, this);
 
         if (listening) {
             addr.sin_family = AF_INET;
             addr.sin_addr.s_addr = htons(INADDR_ANY);
             addr.sin_port = htons(listenPort);
-            if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            int bind_rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+            if (bind_rc != 0) {
+                LogFormat("initUdp: bind() failed fd=%d port=%u rc=%d errno=%d", fd, listenPort, bind_rc, errno);
                 return MAKERESULT(ModuleID, 2);
             }
+            LogFormat("initUdp: bind() success fd=%d port=%u", fd, listenPort);
         }
         rc = setSocketOpts(fd);
         if (R_FAILED(rc)) {
+            LogFormat("initUdp: setSocketOpts failed rc=0x%x", rc);
             return rc;
         }
+        LogFormat("initUdp: complete fd=%d", fd);
 
         this->udp = std::move(udpSocket);
 
@@ -778,7 +786,7 @@ namespace ams::mitm::ldn {
         return rc;
     }
 
-    Result LANDiscovery::initialize(LanEventFunc lanEvent, bool listening) {
+    Result LANDiscovery::initialize(LanEventFunc lanEvent, StateChangeFunc stateChangeEvent, bool listening) {
         if (this->initialized)
         {
             return 0;
@@ -829,6 +837,7 @@ namespace ams::mitm::ldn {
         }
 
         this->lanEvent = lanEvent;
+        this->stateChangeEvent = stateChangeEvent;
         rc = this->initUdp(listening);
         if (R_FAILED(rc)) {
             LogFormat("initUdp %x", rc);

@@ -120,7 +120,9 @@ namespace ams::mitm::ldn {
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
+            typedef std::function<void(CommState, CommState)> StateChangeFunc;
             static const LanEventFunc EmptyFunc;
+            static const StateChangeFunc EmptyStateChangeFunc;
             DisconnectReason disconnect_reason;
         protected:
             friend class LDUdpSocket;
@@ -154,9 +156,12 @@ namespace ams::mitm::ldn {
             Result getFakeMac(MacAddress *mac);
             Result getNodeInfo(NodeInfo *node, const UserConfig *userConfig, u16 localCommunicationVersion);
             LanEventFunc lanEvent;
+            StateChangeFunc stateChangeEvent;
             std::unique_ptr<u8[]> stack;
         public:
-            Result initialize(LanEventFunc lanEvent = EmptyFunc, bool listening = true);
+            Result initialize(LanEventFunc lanEvent = EmptyFunc,
+                              StateChangeFunc stateChangeEvent = EmptyStateChangeFunc,
+                              bool listening = true);
             Result finalize();
             Result initNetworkInfo();
             Result scan(NetworkInfo *networkInfo, u16 *count, ScanFilter filter);
@@ -178,7 +183,9 @@ namespace ams::mitm::ldn {
                 stations({{{1, this}, {2, this}, {3, this}, {4, this}, {5, this}, {6, this}, {7, this}}}),
                 stop(false), initialized(false),
                 networkInfo({}), listenPort(port),
-                state(CommState::None)
+                state(CommState::None),
+                lanEvent(EmptyFunc),
+                stateChangeEvent(EmptyStateChangeFunc)
             {
                 this->stack = std::make_unique<u8[]>(os::ThreadStackAlignment + StackSize);
                 LogFormat("LANDiscovery");
@@ -191,7 +198,11 @@ namespace ams::mitm::ldn {
                 return this->state;
             };
             void setState(CommState v) {
+                const CommState previous = this->state;
                 this->state = v;
+                if (previous != v) {
+                    this->stateChangeEvent(previous, v);
+                }
                 this->lanEvent();
             };
             int stationCount();

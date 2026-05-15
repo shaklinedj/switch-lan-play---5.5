@@ -27,6 +27,7 @@ const char *ldn_gate_event_name(u32 event_type)
     case LANP_GATE_EVENT_CONNECT: return "connect";
     case LANP_GATE_EVENT_IDLE: return "idle";
     case LANP_GATE_EVENT_FINALIZE: return "finalize";
+    case LANP_GATE_EVENT_PREPARE: return "prepare";
     default: return "none";
     }
 }
@@ -57,6 +58,7 @@ static void gate_apply_event_locked(const lanp_gate_event_t *ev)
     g_gate_state.last_event_tick = gate_now_tick();
 
     switch (ev->event_type) {
+    case LANP_GATE_EVENT_PREPARE:
     case LANP_GATE_EVENT_SCAN:
     case LANP_GATE_EVENT_HOST:
     case LANP_GATE_EVENT_CONNECT:
@@ -190,6 +192,8 @@ static void gate_server_thread_fn(void *arg)
     Handle reply_target = INVALID_HANDLE;
     bool close_after_reply = false;
 
+    LLOG(LLOG_INFO, "ldn_gate: server thread started");
+
     while (g_gate_running) {
         Handle handles[2];
         s32 handle_count = 0;
@@ -263,7 +267,17 @@ Result ldn_gate_service_init(void)
         return rc;
     }
 
-    threadStart(&g_gate_thread);
+    rc = threadStart(&g_gate_thread);
+    if (R_FAILED(rc)) {
+        LLOG(LLOG_WARNING, "ldn_gate: threadStart failed: 0x%x", rc);
+        g_gate_running = false;
+        threadClose(&g_gate_thread);
+        smUnregisterService(smEncodeName(LANP_GATE_SERVICE_NAME));
+        svcCloseHandle(g_gate_port);
+        g_gate_port = INVALID_HANDLE;
+        return rc;
+    }
+
     g_gate_thread_started = true;
     g_gate_registered = true;
     LLOG(LLOG_INFO, "ldn_gate: service %s registered", LANP_GATE_SERVICE_NAME);

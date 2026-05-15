@@ -140,16 +140,28 @@ bool foreground_has_game(foreground_state_t *out_state)
     rc = pminfoGetProgramId(&title_id, pid);
     tmp.last_rc = rc;
 
-    if (R_FAILED(rc) || title_id == 0) {
+    if (R_SUCCEEDED(rc) && title_id != 0) {
+        tmp.title_id = title_id;
+        tmp.is_game = !foreground_is_system_title(title_id);
+
         if (out_state) *out_state = tmp;
-        return false;
+        return tmp.is_game;
     }
 
-    tmp.title_id = title_id;
-    tmp.is_game = !foreground_is_system_title(title_id);
+    /* On some firmware/service combinations pm:shell reports a live
+     * application pid, but pm:info refuses to resolve its program id with
+     * rc=0x20f. Let the LDN activity gate make the final start/stop decision
+     * instead of blocking forever in waiting_game. */
+    tmp.is_game = true;
+    static int fallback_count = 0;
+    if (++fallback_count <= 5 || (fallback_count % 60) == 0) {
+        LLOG(LLOG_WARNING,
+             "foreground: pm:info lookup failed for pid=%llu rc=0x%x title=%016llX; allowing app-process fallback",
+             (unsigned long long)pid, rc, (unsigned long long)title_id);
+    }
 
     if (out_state) *out_state = tmp;
-    return tmp.is_game;
+    return true;
 }
 
 const char *foreground_state_reason(const foreground_state_t *state)

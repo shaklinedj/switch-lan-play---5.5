@@ -12,7 +12,13 @@ namespace ams::mitm::ldn {
         Connect = 3,
         Idle = 4,
         Finalize = 5,
+        Prepare = 6,
     };
+
+    /* Open the lanp:gt session once, before the Stratosphere server loop starts.
+     * smGetService must NOT be called from within an IPC handler (deadlock). */
+    void InitGateClient();
+    void FinalizeGateClient();
 
     Result NotifyLanPlayGate(LanPlayGateEvent event_type,
                              u64 process_id,

@@ -32,8 +32,10 @@ namespace ams::mitm::ldn {
             u64 error_state;
             u64 client_process_id;
             u64 client_title_id;
+            IntentId gate_intent_id;
+            bool gate_intent_valid;
         public:
-            ICommunicationService() : state_event(nullptr), error_state(0), client_process_id(0), client_title_id(0) {
+            ICommunicationService() : state_event(nullptr), error_state(0), client_process_id(0), client_title_id(0), gate_intent_id{}, gate_intent_valid(false) {
                 LogFormat("ICommunicationService");
                 /* ... */
             };
@@ -47,6 +49,8 @@ namespace ams::mitm::ldn {
             };
         private:
             void onEventFired();
+            void onLanStateChanged(CommState previous_state, CommState new_state);
+            void cacheGateIntent(const IntentId &intent_id);
         // private:
         public:
             Result Initialize(const sf::ClientProcessId &client_process_id);

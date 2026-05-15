@@ -6,74 +6,165 @@ namespace ams::mitm::ldn {
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
     static_assert(sizeof(ScanFilter) == 0x60, "sizeof(ScanFilter) should be 0x60");
 
+    namespace {
+        const char *comm_state_name(CommState state) {
+            switch (state) {
+                case CommState::None:               return "none";
+                case CommState::Initialized:        return "initialized";
+                case CommState::AccessPoint:        return "access-point";
+                case CommState::AccessPointCreated: return "access-point-created";
+                case CommState::Station:            return "station";
+                case CommState::StationConnected:   return "station-connected";
+                case CommState::Error:              return "error";
+                default:                            return "unknown";
+            }
+        }
+
+        LanPlayGateEvent gate_event_for_state_transition(CommState previous_state, CommState new_state) {
+            switch (new_state) {
+                case CommState::AccessPoint:
+                case CommState::Station:
+                    return LanPlayGateEvent::Prepare;
+                case CommState::AccessPointCreated:
+                    return LanPlayGateEvent::Host;
+                case CommState::StationConnected:
+                    return LanPlayGateEvent::Connect;
+                case CommState::Initialized:
+                    switch (previous_state) {
+                        case CommState::AccessPoint:
+                        case CommState::AccessPointCreated:
+                        case CommState::Station:
+                        case CommState::StationConnected:
+                        case CommState::Error:
+                            return LanPlayGateEvent::Idle;
+                        default:
+                            return LanPlayGateEvent::None;
+                    }
+                case CommState::Error:
+                    return LanPlayGateEvent::Idle;
+                case CommState::None:
+                    return LanPlayGateEvent::Finalize;
+                default:
+                    return LanPlayGateEvent::None;
+            }
+        }
+
+        Result notify_gate_verbose(const char *origin,
+                                   LanPlayGateEvent event_type,
+                                   u64 process_id,
+                                   u64 title_id,
+                                   u64 local_communication_id,
+                                   u16 scene_id) {
+            LogFormat("[GATEDBG] %s: notify begin event=%u pid=%" PRIu64 " tid=%" PRIX64 " intent=%" PRIu64 " scene=%u",
+                      origin,
+                      static_cast<u32>(event_type),
+                      process_id,
+                      title_id,
+                      local_communication_id,
+                      scene_id);
+
+            Result rc = NotifyLanPlayGate(event_type,
+                                          process_id,
+                                          title_id,
+                                          local_communication_id,
+                                          scene_id);
+
+            LogFormat("[GATEDBG] %s: notify end event=%u rc=0x%x",
+                      origin,
+                      static_cast<u32>(event_type),
+                      rc);
+            return rc;
+        }
+
+    }
+
     // https://reswitched.github.io/SwIPC/ifaces.html#nn::ldn::detail::IUserLocalCommunicationService
 
     Result ICommunicationService::Initialize(const sf::ClientProcessId &client_process_id) {
-        this->client_process_id = static_cast<u64>(client_process_id);
+        this->client_process_id = client_process_id.GetValue().value;
         this->client_title_id = 0;
-        LogFormat("ICommunicationService::Initialize pid: %" PRIu64, client_process_id);
+        LogFormat("[GATEDBG] ICommunicationService::Initialize enter pid=%" PRIu64 " tid=%" PRIX64,
+                  this->client_process_id,
+                  this->client_title_id);
 
         if (this->state_event == nullptr) {
             // ClearMode, inter_process
+            LogFormat("[GATEDBG] Initialize: creating state_event");
             this->state_event = new os::SystemEvent(::ams::os::EventClearMode_AutoClear, true);
+        } else {
+            LogFormat("[GATEDBG] Initialize: reusing existing state_event");
         }
 
-        R_TRY(lanDiscovery.initialize([&](){
-            this->onEventFired();
-        }));
+        LogFormat("[GATEDBG] Initialize: calling lanDiscovery.initialize");
+        Result init_rc = lanDiscovery.initialize([&](){
+                                                    this->onEventFired();
+                                                },
+                                                [&](CommState previous_state, CommState new_state){
+                                                    this->onLanStateChanged(previous_state, new_state);
+                                                });
+        if (R_FAILED(init_rc)) {
+            LogFormat("[GATEDBG] Initialize: lanDiscovery.initialize FAILED rc=0x%x", init_rc);
+            return init_rc;
+        }
+
+        LogFormat("[GATEDBG] Initialize: lanDiscovery.initialize OK");
+        LogFormat("[GATEDBG] ICommunicationService::Initialize exit success");
 
         return ResultSuccess();
     }
 
     Result ICommunicationService::InitializeSystem2(u64 unk, const sf::ClientProcessId &client_process_id) {
-        LogFormat("ICommunicationService::InitializeSystem2 unk: %" PRIu64, unk);
+        LogFormat("[GATEDBG] ICommunicationService::InitializeSystem2 unk=%" PRIu64, unk);
         this->error_state = unk;
-        return this->Initialize(client_process_id);
+        Result rc = this->Initialize(client_process_id);
+        // Initialize already notifies the gate, so no need to do it again
+        LogFormat("[GATEDBG] ICommunicationService::InitializeSystem2 rc=0x%x", rc);
+        return rc;
     }
 
     Result ICommunicationService::Finalize() {
-        NotifyLanPlayGate(LanPlayGateEvent::Finalize, this->client_process_id, this->client_title_id, 0, 0);
         Result rc = lanDiscovery.finalize();
+        LogFormat("[GATEDBG] Finalize: lanDiscovery.finalize rc=0x%x", rc);
         if (this->state_event) {
             delete this->state_event;
             this->state_event = nullptr;
+            LogFormat("[GATEDBG] Finalize: state_event released");
         }
         return rc;
     }
 
     Result ICommunicationService::OpenAccessPoint() {
-        return this->lanDiscovery.openAccessPoint();
+        LogFormat("[GATEDBG] OpenAccessPoint: enter");
+        Result rc = this->lanDiscovery.openAccessPoint();
+        LogFormat("[GATEDBG] OpenAccessPoint: lanDiscovery rc=0x%x", rc);
+        return rc;
     }
 
     Result ICommunicationService::CloseAccessPoint() {
-        NotifyLanPlayGate(LanPlayGateEvent::Idle, this->client_process_id, this->client_title_id, 0, 0);
         return this->lanDiscovery.closeAccessPoint();
     }
 
     Result ICommunicationService::DestroyNetwork() {
-        NotifyLanPlayGate(LanPlayGateEvent::Idle, this->client_process_id, this->client_title_id, 0, 0);
         return this->lanDiscovery.destroyNetwork();
     }
 
     Result ICommunicationService::OpenStation() {
-        return this->lanDiscovery.openStation();
+        LogFormat("[GATEDBG] OpenStation: enter");
+        Result rc = this->lanDiscovery.openStation();
+        LogFormat("[GATEDBG] OpenStation: lanDiscovery rc=0x%x", rc);
+        return rc;
     }
 
     Result ICommunicationService::CloseStation() {
-        NotifyLanPlayGate(LanPlayGateEvent::Idle, this->client_process_id, this->client_title_id, 0, 0);
         return this->lanDiscovery.closeStation();
     }
 
     Result ICommunicationService::Disconnect() {
-        NotifyLanPlayGate(LanPlayGateEvent::Idle, this->client_process_id, this->client_title_id, 0, 0);
         return this->lanDiscovery.disconnect();
     }
 
     Result ICommunicationService::CreateNetwork(CreateNetworkConfig data) {
-        NotifyLanPlayGateFromIntent(LanPlayGateEvent::Host,
-                                    this->client_process_id,
-                                    this->client_title_id,
-                                    data.networkConfig.intentId);
+        this->cacheGateIntent(data.networkConfig.intentId);
         return this->lanDiscovery.createNetwork(&data.securityConfig, &data.userConfig, &data.networkConfig);;
     }
 
@@ -164,11 +255,6 @@ namespace ams::mitm::ldn {
         Result rc = 0;
         u16 count = buffer.GetSize();
 
-        NotifyLanPlayGateFromIntent(LanPlayGateEvent::Scan,
-                                    this->client_process_id,
-                                    this->client_title_id,
-                                    filter.networkId.intentId);
-
         rc = lanDiscovery.scan(buffer.GetPointer(), &count, filter);
         outCount.SetValue(count);
 
@@ -182,10 +268,7 @@ namespace ams::mitm::ldn {
         LogHex(&data, sizeof(NetworkInfo));
         LogHex(&param, sizeof(param));
 
-        NotifyLanPlayGateFromIntent(LanPlayGateEvent::Connect,
-                                    this->client_process_id,
-                                    this->client_title_id,
-                                    data.networkId.intentId);
+        this->cacheGateIntent(data.networkId.intentId);
 
         return lanDiscovery.connect(&data, &param.userConfig, param.localCommunicationVersion);
     }
@@ -194,6 +277,53 @@ namespace ams::mitm::ldn {
         if (this->state_event) {
             LogFormat("onEventFired signal_event");
             this->state_event->Signal();
+        }
+    }
+
+    void ICommunicationService::cacheGateIntent(const IntentId &intent_id) {
+        this->gate_intent_id = intent_id;
+        this->gate_intent_valid = true;
+        LogFormat("[GATEDBG] cache intent localCommunicationId=%" PRIu64 " sceneId=%u",
+                  intent_id.localCommunicationId,
+                  intent_id.sceneId);
+    }
+
+    void ICommunicationService::onLanStateChanged(CommState previous_state, CommState new_state) {
+        const LanPlayGateEvent event_type = gate_event_for_state_transition(previous_state, new_state);
+        LogFormat("[GATEDBG] state change %s -> %s gate_event=%u",
+                  comm_state_name(previous_state),
+                  comm_state_name(new_state),
+                  static_cast<u32>(event_type));
+
+        if (event_type == LanPlayGateEvent::None) {
+            return;
+        }
+
+        u64 local_communication_id = 0;
+        u16 scene_id = 0;
+
+        if (event_type == LanPlayGateEvent::Host || event_type == LanPlayGateEvent::Connect) {
+            NetworkInfo info;
+            if (R_SUCCEEDED(this->lanDiscovery.getNetworkInfo(&info))) {
+                this->cacheGateIntent(info.networkId.intentId);
+            }
+        }
+
+        if (this->gate_intent_valid) {
+            local_communication_id = this->gate_intent_id.localCommunicationId;
+            scene_id = this->gate_intent_id.sceneId;
+        }
+
+        Result gate_rc = notify_gate_verbose("StateChange",
+                                             event_type,
+                                             this->client_process_id,
+                                             this->client_title_id,
+                                             local_communication_id,
+                                             scene_id);
+        AMS_UNUSED(gate_rc);
+
+        if (event_type == LanPlayGateEvent::Finalize) {
+            this->gate_intent_valid = false;
         }
     }
 
@@ -208,12 +338,10 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::ScanPrivate() {
-        NotifyLanPlayGate(LanPlayGateEvent::Scan, this->client_process_id, this->client_title_id, 0, 0);
         return 0;
     }
 
     Result ICommunicationService::CreateNetworkPrivate() {
-        NotifyLanPlayGate(LanPlayGateEvent::Host, this->client_process_id, this->client_title_id, 0, 0);
         return 0;
     }
 
@@ -230,7 +358,6 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::ConnectPrivate() {
-        NotifyLanPlayGate(LanPlayGateEvent::Connect, this->client_process_id, this->client_title_id, 0, 0);
         return 0;
     }
 }

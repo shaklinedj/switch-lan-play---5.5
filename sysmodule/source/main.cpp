@@ -298,6 +298,7 @@ static uint8_t s_keepalive_stack[STACK_SIZE] __attribute__((aligned(0x1000)));
 static uint8_t s_ldn_udp_stack[STACK_SIZE]   __attribute__((aligned(0x1000)));
 static uint8_t s_ldn_tcp_stack[STACK_SIZE]   __attribute__((aligned(0x1000)));
 static uint8_t s_psc_stack[STACK_SIZE]       __attribute__((aligned(0x1000)));
+static uint8_t s_pgl_stack[STACK_SIZE]       __attribute__((aligned(0x1000)));
 
 /* PSC sleep/wake state. This lets the sysmodule close runtime sockets before
  * Horizon enters sleep, preventing blocked recvfrom()/accept() from surviving
@@ -308,6 +309,22 @@ static Thread      g_psc_thread;
 static bool        g_psc_thread_started = false;
 static volatile bool g_main_alive = true;
 static struct lan_play *volatile g_active_lp = NULL;
+static volatile bool g_sleep_teardown_requested = false;
+
+static Result g_rc_pgl = 0;
+static Mutex  g_pgl_mutex;
+static bool   g_pgl_mutex_ready = false;
+static Thread g_pgl_thread;
+static bool   g_pgl_thread_started = false;
+static volatile bool g_pgl_running = false;
+static bool   g_pgl_ready = false;
+static bool   g_pgl_observer_open = false;
+static bool   g_pgl_event_open = false;
+static PglEventObserver g_pgl_observer;
+static Event  g_pgl_process_event;
+static u64    g_pgl_app_pid = 0;
+static PmProcessEvent g_pgl_last_event = PmProcessEvent_None;
+static Result g_pgl_last_rc = 0;
 
 /* =========================================================================
  * CRITICAL: libnx sysmodule boilerplate.
@@ -378,6 +395,8 @@ static Result g_rc_fg     = 0;
 static Result g_rc_gate   = 0;
 static Result g_rc_pscm   = 0;
 
+static bool pm_monitors_enabled(void);
+
 static bool g_network_ready = false;
 static bool g_nifm_ready    = false;
 static bool g_bsd_ready     = false;
@@ -443,25 +462,12 @@ static int runtime_network_init(void)
 
 static void runtime_network_exit(void)
 {
-    if (g_socket_ready) {
-        socketExit();
-        g_socket_ready = false;
-    }
-    if (g_bsd_ready) {
-        bsdExit();
-        g_bsd_ready = false;
-    }
-    if (g_nifm_ready) {
-        nifmExit();
-        g_nifm_ready = false;
-    }
-
-    if (g_network_ready) {
-        LLOG(LLOG_INFO, "network: runtime services released");
-    }
-    g_network_ready = false;
+    LLOG(LLOG_INFO, "runtime_network_exit: Closing network resources...");
+    socketExit();
+    bsdExit();
+    nifmExit();
+    LLOG(LLOG_INFO, "runtime_network_exit: Network resources closed.");
 }
-
 
 /* -------------------------------------------------------------------------
  * PSC sleep/wake monitoring
@@ -471,6 +477,7 @@ static void psc_emergency_teardown(struct lan_play *lp)
     if (!lp) return;
 
     LLOG(LLOG_WARNING, "psc: emergency teardown before sleep");
+    g_sleep_teardown_requested = true;
     lp->running = false;
 
     /* Close sockets first. This intentionally does not wait for threads because
@@ -553,6 +560,240 @@ static void psc_monitor_stop(void)
     }
 }
 
+static const char *pgl_process_event_name(PmProcessEvent event)
+{
+    switch (event) {
+        case PmProcessEvent_Exit:       return "exit";
+        case PmProcessEvent_Start:      return "start";
+        case PmProcessEvent_Crash:      return "crash";
+        case PmProcessEvent_DebugStart: return "debug_start";
+        case PmProcessEvent_DebugBreak: return "debug_break";
+        default:                        return "none";
+    }
+}
+
+static void pgl_set_state(u64 pid, PmProcessEvent event, Result rc)
+{
+    if (!g_pgl_mutex_ready) return;
+
+    mutexLock(&g_pgl_mutex);
+    g_pgl_app_pid = pid;
+    g_pgl_last_event = event;
+    g_pgl_last_rc = rc;
+    mutexUnlock(&g_pgl_mutex);
+}
+
+static void pgl_clear_pid(Result rc)
+{
+    if (!g_pgl_mutex_ready) return;
+
+    mutexLock(&g_pgl_mutex);
+    g_pgl_app_pid = 0;
+    g_pgl_last_rc = rc;
+    mutexUnlock(&g_pgl_mutex);
+}
+
+static void pgl_get_state(u64 *pid_out, PmProcessEvent *event_out, Result *rc_out)
+{
+    if (pid_out) *pid_out = 0;
+    if (event_out) *event_out = PmProcessEvent_None;
+    if (rc_out) *rc_out = 0;
+    if (!g_pgl_mutex_ready) return;
+
+    mutexLock(&g_pgl_mutex);
+    if (pid_out) *pid_out = g_pgl_app_pid;
+    if (event_out) *event_out = g_pgl_last_event;
+    if (rc_out) *rc_out = g_pgl_last_rc;
+    mutexUnlock(&g_pgl_mutex);
+}
+
+static bool pgl_monitor_available(void)
+{
+    return g_pgl_ready;
+}
+
+static bool pgl_refresh_application_state(u64 *pid_out)
+{
+    if (pid_out) *pid_out = 0;
+    if (!g_pgl_ready) return false;
+
+    u64 pid = 0;
+    Result rc = pglGetApplicationProcessId(&pid);
+    if (R_SUCCEEDED(rc) && pid != 0) {
+        pgl_set_state(pid, PmProcessEvent_Start, rc);
+        if (pid_out) *pid_out = pid;
+        return true;
+    }
+
+    pgl_clear_pid(rc);
+    return false;
+}
+
+static bool pgl_has_application(u64 *pid_out, PmProcessEvent *event_out, Result *rc_out)
+{
+    if (pid_out) *pid_out = 0;
+    if (event_out) *event_out = PmProcessEvent_None;
+    if (rc_out) *rc_out = 0;
+    if (!g_pgl_ready) return false;
+
+    if (!g_pgl_thread_started) {
+        pgl_refresh_application_state(NULL);
+    }
+
+    pgl_get_state(pid_out, event_out, rc_out);
+    return pid_out ? (*pid_out != 0) : (g_pgl_app_pid != 0);
+}
+
+static void pgl_thread_fn(void *arg)
+{
+    (void)arg;
+    LLOG(LLOG_INFO, "pgl: monitor thread started");
+
+    while (g_pgl_running) {
+        if (!g_pgl_event_open || g_pgl_process_event.revent == INVALID_HANDLE) {
+            svcSleepThread(1000000000LL);
+            continue;
+        }
+
+        Result rc = waitSingleHandle(g_pgl_process_event.revent, 1000000000LL);
+        if (R_FAILED(rc)) continue;
+
+        PmProcessEventInfo info;
+        rc = pglEventObserverGetProcessEventInfo(&g_pgl_observer, &info);
+        if (R_FAILED(rc)) {
+            pgl_refresh_application_state(NULL);
+            continue;
+        }
+
+        u64 current_pid = 0;
+        pgl_get_state(&current_pid, NULL, NULL);
+
+        switch (info.event) {
+            case PmProcessEvent_Start:
+            case PmProcessEvent_DebugStart:
+                pgl_set_state(info.process_id, info.event, rc);
+                break;
+
+            case PmProcessEvent_Exit:
+            case PmProcessEvent_Crash:
+                if (current_pid == 0 || current_pid == info.process_id) {
+                    pgl_set_state(0, info.event, rc);
+                } else {
+                    pgl_set_state(current_pid, info.event, rc);
+                }
+                break;
+
+            default:
+                pgl_set_state(current_pid, info.event, rc);
+                break;
+        }
+
+        LLOG(LLOG_INFO, "pgl: app event=%s pid=%llu",
+             pgl_process_event_name(info.event),
+             (unsigned long long)info.process_id);
+    }
+
+    LLOG(LLOG_INFO, "pgl: monitor thread exiting");
+}
+
+static void pgl_monitor_start(void)
+{
+    if (!g_pgl_ready || g_pgl_thread_started) return;
+
+    Result rc = pglGetEventObserver(&g_pgl_observer);
+    if (R_FAILED(rc)) {
+        LLOG(LLOG_WARNING, "pgl: pglGetEventObserver failed: 0x%x", rc);
+        return;
+    }
+    g_pgl_observer_open = true;
+
+    rc = pglEventObserverGetProcessEvent(&g_pgl_observer, &g_pgl_process_event);
+    if (R_FAILED(rc)) {
+        LLOG(LLOG_WARNING, "pgl: pglEventObserverGetProcessEvent failed: 0x%x", rc);
+        pglEventObserverClose(&g_pgl_observer);
+        g_pgl_observer_open = false;
+        return;
+    }
+    g_pgl_event_open = true;
+    g_pgl_running = true;
+
+    rc = threadCreate(&g_pgl_thread, pgl_thread_fn, NULL,
+                      s_pgl_stack, sizeof(s_pgl_stack), 31, -2);
+    if (R_FAILED(rc)) {
+        LLOG(LLOG_WARNING, "pgl: threadCreate failed: 0x%x", rc);
+        g_pgl_running = false;
+        eventClose(&g_pgl_process_event);
+        g_pgl_event_open = false;
+        pglEventObserverClose(&g_pgl_observer);
+        g_pgl_observer_open = false;
+        return;
+    }
+
+    threadStart(&g_pgl_thread);
+    g_pgl_thread_started = true;
+}
+
+static void pgl_monitor_stop(void)
+{
+    g_pgl_running = false;
+
+    if (g_pgl_thread_started) {
+        threadWaitForExit(&g_pgl_thread);
+        threadClose(&g_pgl_thread);
+        g_pgl_thread_started = false;
+    }
+    if (g_pgl_event_open) {
+        eventClose(&g_pgl_process_event);
+        g_pgl_event_open = false;
+    }
+    if (g_pgl_observer_open) {
+        pglEventObserverClose(&g_pgl_observer);
+        g_pgl_observer_open = false;
+    }
+    if (g_pgl_ready) {
+        pglExit();
+        g_pgl_ready = false;
+    }
+}
+
+static void pgl_monitor_init_late(void)
+{
+    if (g_pgl_ready) return;
+
+    Result sm_rc = smInitialize();
+    if (R_FAILED(sm_rc)) {
+        g_rc_pgl = sm_rc;
+        LLOG(LLOG_WARNING, "pgl: smInitialize failed: 0x%x", sm_rc);
+        return;
+    }
+
+    g_rc_pgl = pglInitialize();
+    smExit();
+    if (R_FAILED(g_rc_pgl)) {
+        LLOG(LLOG_WARNING, "pgl: initialize failed: 0x%x", g_rc_pgl);
+        return;
+    }
+
+    mutexInit(&g_pgl_mutex);
+    g_pgl_mutex_ready = true;
+    g_pgl_ready = true;
+
+    if (pgl_refresh_application_state(NULL)) {
+        u64 pid = 0;
+        pgl_get_state(&pid, NULL, NULL);
+        LLOG(LLOG_INFO, "pgl: current application pid=%llu", (unsigned long long)pid);
+    } else {
+        u64 pid = 0;
+        PmProcessEvent event = PmProcessEvent_None;
+        Result rc = 0;
+        pgl_get_state(&pid, &event, &rc);
+        LLOG(LLOG_INFO, "pgl: no running application yet (last=%s rc=0x%x)",
+             pgl_process_event_name(event), rc);
+    }
+
+    pgl_monitor_start();
+}
+
 /* -------------------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------------- */
@@ -582,7 +823,11 @@ extern "C" void __appInit(void)
     g_log_mutex_ready = true;
 
     g_rc_setsys = setsysInitialize();
-    g_rc_pscm = pscmInitialize();
+    if (pm_monitors_enabled()) {
+        g_rc_pscm = pscmInitialize();
+    } else {
+        g_rc_pscm = 0;
+    }
 
     /* Network services are intentionally NOT initialized at boot.
      * They are opened lazily inside run_service(), after the foreground gate
@@ -602,16 +847,24 @@ extern "C" void __appInit(void)
      * until a game actually enters local wireless mode. */
     g_rc_gate = ldn_gate_service_init();
 
+    /* PGL is intentionally initialized later from main() after boot has
+     * settled. This keeps one more system service out of the earliest boot
+     * path while we are still chasing suspend/resume and HBL regressions. */
+    g_rc_pgl = 0;
+
     /* Close the service manager session now that lookups are done */
     smExit();
 }
 
 extern "C" void __appExit(void)
 {
+    LLOG(LLOG_INFO, "__appExit: Cleaning up sysmodule...");
     psc_monitor_stop();
+    pgl_monitor_stop();
     ldn_gate_service_exit();
     foreground_detector_exit();
     runtime_network_exit();
+    LLOG(LLOG_INFO, "__appExit: Cleanup complete.");
     if (R_SUCCEEDED(g_rc_pscm)) pscmExit();
     fsdevUnmountAll();
     setsysExit();
@@ -641,8 +894,18 @@ static bool foreground_gate_disabled_by_file(void)
     return stat("sdmc:/config/lan-play/disable_foreground_gate", &st) == 0;
 }
 
+/* PM-facing monitors are disabled by default to avoid service regressions on
+ * some firmware/CFW combinations. Create this file to opt-in explicitly:
+ *   sdmc:/config/lan-play/enable_pm_monitors */
+static bool pm_monitors_enabled(void)
+{
+    struct stat st;
+    return stat("sdmc:/config/lan-play/enable_pm_monitors", &st) == 0;
+}
+
 static bool foreground_gate_enabled(void)
 {
+    if (!pm_monitors_enabled()) return false;
     return !foreground_gate_disabled_by_file() && foreground_detector_available();
 }
 
@@ -656,8 +919,7 @@ static bool ldn_activity_gate_disabled_by_file(void)
 
 static bool ldn_activity_gate_enabled(void)
 {
-    return foreground_gate_enabled() &&
-           ldn_gate_service_available() &&
+    return ldn_gate_service_available() &&
            !ldn_activity_gate_disabled_by_file();
 }
 
@@ -701,11 +963,27 @@ static bool wait_for_ldn_activity(void)
 
     int quiet_ticks = 0;
     while (true) {
-        foreground_state_t fg;
-        if (!foreground_has_game(&fg)) {
-            write_status_waiting_game(&fg);
-            LLOG(LLOG_INFO, "ldn_gate: foreground disappeared before LDN (%s)", foreground_state_reason(&fg));
-            return false;
+        if (pgl_monitor_available()) {
+            u64 app_pid = 0;
+            PmProcessEvent app_event = PmProcessEvent_None;
+            Result app_rc = 0;
+            if (!pgl_has_application(&app_pid, &app_event, &app_rc)) {
+                write_status_waiting_game(NULL);
+                if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
+                    LLOG(LLOG_INFO, "pgl: waiting for application before LDN (last=%s rc=0x%x)",
+                         pgl_process_event_name(app_event), app_rc);
+                }
+                quiet_ticks++;
+
+                struct stat reload_st;
+                if (stat("sdmc:/tmp/lanplay.reload", &reload_st) == 0) {
+                    unlink("sdmc:/tmp/lanplay.reload");
+                    LLOG(LLOG_INFO, "pgl: reload trigger consumed while waiting for application");
+                }
+
+                svcSleepThread(1000000000LL);
+                continue;
+            }
         }
 
         lanp_gate_state_t gate;
@@ -719,7 +997,7 @@ static bool wait_for_ldn_activity(void)
             return true;
         }
 
-        write_status_waiting_ldn(&fg, &gate);
+        write_status_waiting_ldn(NULL, &gate);
         if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
             LLOG(LLOG_INFO, "ldn_gate: waiting for LDN activity (last=%s active=%u)",
                  ldn_gate_event_name(gate.event_type), gate.active);
@@ -738,6 +1016,18 @@ static bool wait_for_ldn_activity(void)
 
 static bool ldn_runtime_still_allowed(const char *phase)
 {
+    if (ldn_activity_gate_enabled() && pgl_monitor_available()) {
+        u64 app_pid = 0;
+        PmProcessEvent app_event = PmProcessEvent_None;
+        Result app_rc = 0;
+        if (!pgl_has_application(&app_pid, &app_event, &app_rc)) {
+            LLOG(LLOG_INFO, "pgl: application missing during %s (last=%s rc=0x%x) — stopping LAN runtime",
+                 phase ? phase : "runtime", pgl_process_event_name(app_event), app_rc);
+            write_status_waiting_game(NULL);
+            return false;
+        }
+    }
+
     if (!ldn_activity_gate_enabled()) return true;
 
     if (ldn_gate_is_active()) return true;
@@ -809,6 +1099,7 @@ static bool wait_for_foreground_game(void)
 
 static bool foreground_runtime_still_allowed(const char *phase)
 {
+    if (ldn_activity_gate_enabled()) return true;
     if (!foreground_gate_enabled()) return true;
 
     foreground_state_t fg;
@@ -822,6 +1113,8 @@ static bool foreground_runtime_still_allowed(const char *phase)
 
 static int run_service(void)
 {
+    g_sleep_teardown_requested = false;
+
     if (R_SUCCEEDED(g_rc_fs)) ensure_tmp_dir();
 
     LLOG(LLOG_INFO, "=== switch-lan-play sysmodule v1.14 starting ===");
@@ -1129,6 +1422,12 @@ static int run_service(void)
     /* 10. Service Loop (Restartable without reboot)                       */
     /* ------------------------------------------------------------------ */
     while (true) {
+        if (g_sleep_teardown_requested || !lp->running) {
+            LLOG(LLOG_INFO, "runtime: sleep teardown requested, stopping service loop");
+            write_status_error("Suspendiendo: cerrando red para modo reposo");
+            break;
+        }
+
         /* Write status for the Homebrew App to read */
         FILE *sf = fopen("sdmc:/tmp/lanplay.status", "w");
         if (sf) {
@@ -1234,9 +1533,15 @@ int main(int argc, char *argv[])
     LLOG(LLOG_INFO, "  FS:     0x%08X", g_rc_fs);
     LLOG(LLOG_INFO, "  SetSys: 0x%08X", g_rc_setsys);
     LLOG(LLOG_INFO, "  Network: lazy init enabled");
-    LLOG(LLOG_INFO, "  FG:     lazy init pending");
+    if (pm_monitors_enabled()) {
+        LLOG(LLOG_INFO, "  FG:     lazy init pending");
+        LLOG(LLOG_INFO, "  PGL:    late init pending");
+    } else {
+        LLOG(LLOG_INFO, "  FG:     disabled (pm monitors off)");
+        LLOG(LLOG_INFO, "  PGL:    disabled (pm monitors off)");
+    }
     LLOG(LLOG_INFO, "  Gate:   0x%08X", g_rc_gate);
-    LLOG(LLOG_INFO, "  PSC:    0x%08X", g_rc_pscm);
+    LLOG(LLOG_INFO, "  PSC:    %s", pm_monitors_enabled() ? "enabled" : "disabled");
 
     if (R_FAILED(g_rc_fs)) {
         LLOG(LLOG_ERROR, "CRITICAL: FS failed to initialize. Check SD card/mount state.");
@@ -1244,22 +1549,34 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    /* Give Horizon boot services time to settle before touching pm:shell /
-     * pm:info. This mirrors the stable behavior from lanplay-pc-less while
-     * still keeping the heavy network runtime off. */
-    for (int i = 0; i < 15; i++) svcSleepThread(1000000000LL);
+    if (pm_monitors_enabled()) {
+        /* Give Horizon boot services time to settle before touching PM/PGL. */
+        for (int i = 0; i < 15; i++) svcSleepThread(1000000000LL);
 
-    psc_monitor_start();
+        pgl_monitor_init_late();
+        LLOG(LLOG_INFO, "  PGL:    0x%08X", g_rc_pgl);
 
-    g_rc_fg = foreground_detector_init();
-    LLOG(LLOG_INFO, "  FG:     0x%08X", g_rc_fg);
+        psc_monitor_start();
+    } else {
+        LLOG(LLOG_INFO, "pm monitors disabled: skipping pgl/psc init");
+    }
 
     int restart_count = 0;
     while (true) {
-        wait_for_foreground_game();
-        if (!wait_for_ldn_activity()) {
-            svcSleepThread(1000000000LL);
-            continue;
+        if (ldn_activity_gate_enabled()) {
+            LLOG(LLOG_INFO, "  FG:     skipped (ldn_gate primary)");
+            if (!wait_for_ldn_activity()) {
+                svcSleepThread(1000000000LL);
+                continue;
+            }
+        } else {
+            if (pm_monitors_enabled()) {
+                g_rc_fg = foreground_detector_init();
+                LLOG(LLOG_INFO, "  FG:     0x%08X", g_rc_fg);
+                wait_for_foreground_game();
+            } else {
+                LLOG(LLOG_WARNING, "foreground gate unavailable: pm monitors disabled");
+            }
         }
         restart_count = 0;
         if (run_service() == 0) break;
