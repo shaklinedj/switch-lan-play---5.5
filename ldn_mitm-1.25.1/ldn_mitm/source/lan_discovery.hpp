@@ -157,7 +157,6 @@ namespace ams::mitm::ldn {
             Result getNodeInfo(NodeInfo *node, const UserConfig *userConfig, u16 localCommunicationVersion);
             LanEventFunc lanEvent;
             StateChangeFunc stateChangeEvent;
-            std::unique_ptr<u8[]> stack;
         public:
             Result initialize(LanEventFunc lanEvent = EmptyFunc,
                               StateChangeFunc stateChangeEvent = EmptyStateChangeFunc,
@@ -187,7 +186,6 @@ namespace ams::mitm::ldn {
                 lanEvent(EmptyFunc),
                 stateChangeEvent(EmptyStateChangeFunc)
             {
-                this->stack = std::make_unique<u8[]>(os::ThreadStackAlignment + StackSize);
                 LogFormat("LANDiscovery");
             };
             ~LANDiscovery();

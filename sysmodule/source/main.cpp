@@ -146,12 +146,33 @@ static int resolve_from_builtin_fallback(const char *host, struct in_addr *out_a
 
 void nx_log(int level, const char *fmt, ...)
 {
-    if (level > LLOG_DEBUG) return;
+    static bool s_logging_disabled = false;
+    static bool s_verbose_logging = false;
+    static u64 s_last_check_tick = 0;
+    const u64 now_tick = svcGetSystemTick();
+
+    // Refrescar estado de flags de logs cada 2 segundos
+    if (s_last_check_tick == 0 || (now_tick - s_last_check_tick) >= (2 * LANP_GATE_TICKS_PER_SECOND)) {
+        s_last_check_tick = now_tick;
+        struct stat st;
+        s_logging_disabled = (stat("sdmc:/config/lan-play/disable_logging", &st) == 0);
+        s_verbose_logging = (stat("sdmc:/config/lan-play/enable_verbose_logging", &st) == 0);
+    }
+
+    if (s_logging_disabled) return;
+
+    int max_level = s_verbose_logging ? LLOG_DEBUG : LLOG_INFO;
+    if (level > max_level) return;
+
+    static u64 s_log_start_tick = 0;
+    if (s_log_start_tick == 0) s_log_start_tick = now_tick;
+    const u64 rel_ms = ((now_tick - s_log_start_tick) * 1000ULL) / LANP_GATE_TICKS_PER_SECOND;
 
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    int len = snprintf(buf, sizeof(buf), "[LanPlay][%s] ", level_names[level]);
+    int len = snprintf(buf, sizeof(buf), "[LanPlay][t+%llums][%s] ",
+                       (unsigned long long)rel_ms, level_names[level]);
     vsnprintf(buf + len, sizeof(buf) - len, fmt, ap);
     va_end(ap);
 
@@ -176,7 +197,7 @@ void nx_log(int level, const char *fmt, ...)
         fclose(f);
 
         time_t now = time(NULL);
-        if (level <= LLOG_ERROR || g_last_log_commit == 0 || now - g_last_log_commit >= 5) {
+        if (level <= LLOG_ERROR || g_last_log_commit == 0 || now - g_last_log_commit >= 1) {
             fsdevCommitDevice("sdmc");
             g_last_log_commit = now;
         }
@@ -297,16 +318,11 @@ static uint8_t s_relay_stack[STACK_SIZE]     __attribute__((aligned(0x1000)));
 static uint8_t s_keepalive_stack[STACK_SIZE] __attribute__((aligned(0x1000)));
 static uint8_t s_ldn_udp_stack[STACK_SIZE]   __attribute__((aligned(0x1000)));
 static uint8_t s_ldn_tcp_stack[STACK_SIZE]   __attribute__((aligned(0x1000)));
-static uint8_t s_psc_stack[STACK_SIZE]       __attribute__((aligned(0x1000)));
 static uint8_t s_pgl_stack[STACK_SIZE]       __attribute__((aligned(0x1000)));
 
-/* PSC sleep/wake state. This lets the sysmodule close runtime sockets before
- * Horizon enters sleep, preventing blocked recvfrom()/accept() from surviving
- * suspend/resume. */
-static PscPmModule g_psc_module;
-static Handle      g_psc_event = INVALID_HANDLE;
-static Thread      g_psc_thread;
-static bool        g_psc_thread_started = false;
+/* -------------------------------------------------------------------------
+ * Globals
+ * ---------------------------------------------------------------------- */
 static volatile bool g_main_alive = true;
 static struct lan_play *volatile g_active_lp = NULL;
 static volatile bool g_sleep_teardown_requested = false;
@@ -417,7 +433,7 @@ static int runtime_network_init(void)
         return -1;
     }
 
-    g_rc_nifm = nifmInitialize(NifmServiceType_Admin);
+    g_rc_nifm = nifmInitialize(NifmServiceType_System);
     if (R_FAILED(g_rc_nifm)) {
         g_rc_nifm = nifmInitialize(NifmServiceType_User);
     }
@@ -460,105 +476,37 @@ static int runtime_network_init(void)
     return 0;
 }
 
+static void runtime_network_cleanup_final(void)
+{
+    LLOG(LLOG_INFO, "runtime_network_cleanup_final: Closing network resources...");
+    if (g_socket_ready) {
+        socketExit();
+        g_socket_ready = false;
+    }
+    if (g_bsd_ready) {
+        bsdExit();
+        g_bsd_ready = false;
+    }
+    if (g_nifm_ready) {
+        nifmExit();
+        g_nifm_ready = false;
+    }
+    g_network_ready = false;
+    LLOG(LLOG_INFO, "runtime_network_cleanup_final: Network resources closed.");
+}
+
 static void runtime_network_exit(void)
 {
-    LLOG(LLOG_INFO, "runtime_network_exit: Closing network resources...");
-    socketExit();
-    bsdExit();
-    nifmExit();
-    LLOG(LLOG_INFO, "runtime_network_exit: Network resources closed.");
+    /* No-op. We no longer tear down the system BSD/NIFM sessions between
+     * game launches. Releasing BsdServiceType_System while the user is
+     * navigating the HOME menu can crash netConnect if it tries to use it.
+     * The OS handles are now held globally until __appExit. */
 }
 
 /* -------------------------------------------------------------------------
  * PSC sleep/wake monitoring
  * ---------------------------------------------------------------------- */
-static void psc_emergency_teardown(struct lan_play *lp)
-{
-    if (!lp) return;
-
-    LLOG(LLOG_WARNING, "psc: emergency teardown before sleep");
-    g_sleep_teardown_requested = true;
-    lp->running = false;
-
-    /* Close sockets first. This intentionally does not wait for threads because
-     * PSC acknowledgements must be fast; the normal cleanup path will join and
-     * close thread handles afterwards. */
-    ldn_bridge_close(lp);
-    lan_client_close(lp);
-    tap_close(lp);
-}
-
-static void psc_thread_fn(void *arg)
-{
-    (void)arg;
-    LLOG(LLOG_INFO, "psc: monitor thread started");
-
-    while (g_main_alive) {
-        if (g_psc_event == INVALID_HANDLE) {
-            svcSleepThread(1000000000LL);
-            continue;
-        }
-
-        Result rc = waitSingleHandle(g_psc_event, 1000000000LL);
-        if (R_FAILED(rc)) {
-            /* Timeout is expected. Other errors are logged sparingly. */
-            continue;
-        }
-
-        PscPmState state;
-        u32 flags = 0;
-        rc = pscPmModuleGetRequest(&g_psc_module, &state, &flags);
-        if (R_FAILED(rc)) {
-            LLOG(LLOG_WARNING, "psc: get request failed: 0x%x", rc);
-            continue;
-        }
-
-        LLOG(LLOG_INFO, "psc: state=%u flags=%u", (u32)state, flags);
-
-        if (state == PscPmState_ReadySleep) {
-            struct lan_play *lp = (struct lan_play *)g_active_lp;
-            if (lp) psc_emergency_teardown(lp);
-        }
-
-        pscPmModuleAcknowledge(&g_psc_module, state);
-    }
-
-    LLOG(LLOG_INFO, "psc: monitor thread exiting");
-}
-
-static void psc_monitor_start(void)
-{
-    if (g_psc_thread_started) return;
-    if (R_FAILED(g_rc_pscm)) return;
-
-    Result rc = pscmGetPmModule(&g_psc_module, (PscPmModuleId)101, NULL, 0, true);
-    if (R_FAILED(rc)) {
-        LLOG(LLOG_WARNING, "psc: pscmGetPmModule failed: 0x%x", rc);
-        return;
-    }
-
-    g_psc_event = g_psc_module.event.revent;
-    rc = threadCreate(&g_psc_thread, psc_thread_fn, NULL,
-                      s_psc_stack, sizeof(s_psc_stack), 31, -2);
-    if (R_FAILED(rc)) {
-        LLOG(LLOG_WARNING, "psc: threadCreate failed: 0x%x", rc);
-        g_psc_event = INVALID_HANDLE;
-        return;
-    }
-
-    threadStart(&g_psc_thread);
-    g_psc_thread_started = true;
-}
-
-static void psc_monitor_stop(void)
-{
-    g_main_alive = false;
-    if (g_psc_thread_started) {
-        threadWaitForExit(&g_psc_thread);
-        threadClose(&g_psc_thread);
-        g_psc_thread_started = false;
-    }
-}
+/* PSC hooks removed to prevent omm panics. Sockets will be suspended natively by bsd. */
 
 static const char *pgl_process_event_name(PmProcessEvent event)
 {
@@ -823,11 +771,9 @@ extern "C" void __appInit(void)
     g_log_mutex_ready = true;
 
     g_rc_setsys = setsysInitialize();
-    if (pm_monitors_enabled()) {
-        g_rc_pscm = pscmInitialize();
-    } else {
-        g_rc_pscm = 0;
-    }
+    /* PSC is always initialized — sleep/wake handling is independent of
+     * the pm_monitors flag (which gates PGL/foreground only). */
+    g_rc_pscm = pscmInitialize();
 
     /* Network services are intentionally NOT initialized at boot.
      * They are opened lazily inside run_service(), after the foreground gate
@@ -859,13 +805,11 @@ extern "C" void __appInit(void)
 extern "C" void __appExit(void)
 {
     LLOG(LLOG_INFO, "__appExit: Cleaning up sysmodule...");
-    psc_monitor_stop();
     pgl_monitor_stop();
     ldn_gate_service_exit();
     foreground_detector_exit();
-    runtime_network_exit();
+    runtime_network_cleanup_final();
     LLOG(LLOG_INFO, "__appExit: Cleanup complete.");
-    if (R_SUCCEEDED(g_rc_pscm)) pscmExit();
     fsdevUnmountAll();
     setsysExit();
     fsExit();
@@ -986,9 +930,12 @@ static bool wait_for_ldn_activity(void)
             }
         }
 
+        /* Refresh state from ldn_mitm before checking */
+        ldn_gate_poll();
+
         lanp_gate_state_t gate;
         ldn_gate_get_state(&gate);
-        if (ldn_gate_is_active()) {
+        if (ldn_gate_is_active_for_start()) {
             LLOG(LLOG_INFO, "ldn_gate: active event=%s pid=%llu intent=%llu scene=%u; starting LAN runtime",
                  ldn_gate_event_name(gate.event_type),
                  (unsigned long long)gate.process_id,
@@ -999,8 +946,9 @@ static bool wait_for_ldn_activity(void)
 
         write_status_waiting_ldn(NULL, &gate);
         if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
-            LLOG(LLOG_INFO, "ldn_gate: waiting for LDN activity (last=%s active=%u)",
-                 ldn_gate_event_name(gate.event_type), gate.active);
+            LLOG(LLOG_INFO, "ldn_gate: waiting for LDN activity (last=%s active=%u magic=0x%x)",
+                 ldn_gate_event_name(gate.event_type), gate.active, gate.magic);
+            if (R_SUCCEEDED(g_rc_fs)) fsdevCommitDevice("sdmc");
         }
         quiet_ticks++;
 
@@ -1010,6 +958,10 @@ static bool wait_for_ldn_activity(void)
             LLOG(LLOG_INFO, "ldn_gate: reload trigger consumed while waiting for LDN");
         }
 
+        /* Sleep 1s between polls. We can't use ldn_gate_wait_event() here
+         * because runtime_network_exit() may have invalidated the IPC
+         * session / event handle.  Polling every 1s is fine for a wait
+         * loop that only runs between games. */
         svcSleepThread(1000000000LL);
     }
 }
@@ -1029,6 +981,11 @@ static bool ldn_runtime_still_allowed(const char *phase)
     }
 
     if (!ldn_activity_gate_enabled()) return true;
+
+    /* Refresh gate state before checking — ldn_gate_poll() is not called
+     * anywhere else in the service loop, so without this the gate state
+     * would be stale (last value from wait_for_ldn_activity). */
+    ldn_gate_poll();
 
     if (ldn_gate_is_active()) return true;
 
@@ -1159,12 +1116,40 @@ static int run_service(void)
         wait_seconds += 2;
     }
 
-    /* Give Horizon extra time to set up default gateway & routing table.
-     * nifmGetCurrentIpAddress can return an IP before the route is ready,
-     * causing "Host is unreachable" on the first sendto().  A short
-     * stabilization sleep avoids this race condition.                      */
-    LLOG(LLOG_INFO, "Waiting 5s for routing table to stabilize...");
-    svcSleepThread(5000000000LL); /* 5 seconds */
+    /* Probe the routing table instead of sleeping a fixed 5 seconds.
+     * nifmGetCurrentIpAddress can return an IP before the route is ready;
+     * we retry sendto() to 8.8.8.8:53 (UDP, no data sent) until it stops
+     * returning EHOSTUNREACH / ENETUNREACH, or until 5 seconds pass.
+     * On restarts (WiFi already stable) this completes in 0-1 iterations. */
+    {
+        int route_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (route_fd >= 0) {
+            struct sockaddr_in probe_dst;
+            memset(&probe_dst, 0, sizeof(probe_dst));
+            probe_dst.sin_family = AF_INET;
+            probe_dst.sin_port   = htons(53);
+            inet_aton("8.8.8.8", &probe_dst.sin_addr);
+
+            int ready = 0;
+            for (int i = 0; i < 5; i++) {
+                uint8_t dummy = 0xFF;
+                ssize_t r = sendto(route_fd, &dummy, 1, 0,
+                                   (struct sockaddr *)&probe_dst, sizeof(probe_dst));
+                if (r >= 0 || (errno != EHOSTUNREACH && errno != ENETUNREACH)) {
+                    LLOG(LLOG_INFO, "Route probe OK after %ds (errno=%d)", i, errno);
+                    ready = 1;
+                    break;
+                }
+                LLOG(LLOG_DEBUG, "Route not ready yet (%s), waiting 1s...", strerror(errno));
+                svcSleepThread(1000000000LL);
+            }
+            if (!ready) LLOG(LLOG_INFO, "Route probe timed out — proceeding anyway");
+            close(route_fd);
+        } else {
+            LLOG(LLOG_WARNING, "Route probe socket failed — falling back to 2s wait");
+            svcSleepThread(2000000000LL);
+        }
+    }
 
     /* ------------------------------------------------------------------ */
     /* 1. Read config                                                       */
@@ -1502,6 +1487,9 @@ cleanup:
         threadClose(&lp->tap_thread);
     }
 
+    /* Wait for any concurrent TCP proxy sessions spawned by ldn_bridge */
+    ldn_bridge_wait_sessions();
+
     g_active_lp = NULL;
     lan_play_free(lp);
     runtime_network_exit();
@@ -1541,7 +1529,6 @@ int main(int argc, char *argv[])
         LLOG(LLOG_INFO, "  PGL:    disabled (pm monitors off)");
     }
     LLOG(LLOG_INFO, "  Gate:   0x%08X", g_rc_gate);
-    LLOG(LLOG_INFO, "  PSC:    %s", pm_monitors_enabled() ? "enabled" : "disabled");
 
     if (R_FAILED(g_rc_fs)) {
         LLOG(LLOG_ERROR, "CRITICAL: FS failed to initialize. Check SD card/mount state.");
@@ -1549,16 +1536,16 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    /* PSC monitor was removed to prevent omm panics. */
+
     if (pm_monitors_enabled()) {
-        /* Give Horizon boot services time to settle before touching PM/PGL. */
+        /* Give Horizon boot services time to settle before touching PGL. */
         for (int i = 0; i < 15; i++) svcSleepThread(1000000000LL);
 
         pgl_monitor_init_late();
         LLOG(LLOG_INFO, "  PGL:    0x%08X", g_rc_pgl);
-
-        psc_monitor_start();
     } else {
-        LLOG(LLOG_INFO, "pm monitors disabled: skipping pgl/psc init");
+        LLOG(LLOG_INFO, "pm monitors disabled: skipping pgl init");
     }
 
     int restart_count = 0;
@@ -1569,6 +1556,7 @@ int main(int argc, char *argv[])
                 svcSleepThread(1000000000LL);
                 continue;
             }
+            restart_count = 0; /* Reset only on fresh LDN activation */
         } else {
             if (pm_monitors_enabled()) {
                 g_rc_fg = foreground_detector_init();
@@ -1577,8 +1565,8 @@ int main(int argc, char *argv[])
             } else {
                 LLOG(LLOG_WARNING, "foreground gate unavailable: pm monitors disabled");
             }
+            restart_count = 0;
         }
-        restart_count = 0;
         if (run_service() == 0) break;
         restart_count++;
         /* Exponential backoff: 3s, 6s, 12s, ... capped at 60s */
@@ -1586,9 +1574,13 @@ int main(int argc, char *argv[])
         for (int i = 1; i < restart_count && delay < 60; i++) delay *= 2;
         if (delay > 60) delay = 60;
         LLOG(LLOG_INFO, "Restarting service loop (attempt #%d, backoff %ds)...", restart_count, delay);
+        if (R_SUCCEEDED(g_rc_fs)) fsdevCommitDevice("sdmc");
+        LLOG(LLOG_INFO, "Restart backoff begin (%ds)", delay);
         svcSleepThread((s64)delay * 1000000000LL);
+        LLOG(LLOG_INFO, "Restart backoff end; resuming gate wait");
+        /* Force log flush so we can see this line even if the next
+         * wait_for_ldn_activity() blocks for a long time. */
+        if (R_SUCCEEDED(g_rc_fs)) fsdevCommitDevice("sdmc");
     }
-
-    psc_monitor_stop();
     return 0;
 }

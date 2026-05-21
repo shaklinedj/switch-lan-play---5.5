@@ -14,7 +14,6 @@ int send_payloads(
         if (buf - (uint8_t *)self->buffer + part->len >= self->buffer_len) {
             LLOG(LLOG_ERROR, "send_payloads too large wanted: %d buffer_len: %d", buf - (uint8_t *)self->buffer + part->len, self->buffer_len);
             LLOG(LLOG_DEBUG, "send_payloads buffer: %p", self->buffer);
-            assert(0);
             return -1;
         }
         memcpy(buf, part->ptr, part->len);
@@ -138,6 +137,10 @@ void parse_ether(const u_char *packet, uint16_t len, struct ether_frame *ether)
 
 int process_ether(struct packet_ctx *arg, const u_char *packet, uint16_t len)
 {
+    if (len < ETHER_OFF_END) {
+        return -1;
+    }
+
     struct ether_frame ether;
     parse_ether(packet, len, &ether);
 

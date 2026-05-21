@@ -185,6 +185,11 @@ static int lan_client_process(struct lan_play *lp,
 static int lan_client_process_frag(struct lan_play *lp,
                                    const uint8_t *packet, uint16_t len)
 {
+    if (len < LC_FRAG_HEADER_LEN) {
+        LLOG(LLOG_WARNING, "relay: invalid fragment length %u < header", len);
+        return 0;
+    }
+
     struct lan_client_fragment *frags = lp->frags;
 
     uint8_t  src[4], dst[4];
@@ -195,6 +200,27 @@ static int lan_client_process_frag(struct lan_play *lp,
     uint8_t  total_part = READ_NET8(packet,  LC_FRAG_TOTAL_PART);
     uint16_t frag_len   = READ_NET16(packet, LC_FRAG_LEN);
     uint16_t pmtu       = READ_NET16(packet, LC_FRAG_PMTU);
+
+    if (total_part == 0 || total_part > 8) {
+        LLOG(LLOG_WARNING, "relay: invalid fragment total_part=%u", total_part);
+        return 0;
+    }
+    if (part_num >= total_part) {
+        LLOG(LLOG_WARNING, "relay: invalid fragment part=%u total=%u", part_num, total_part);
+        return 0;
+    }
+    if (pmtu == 0 || frag_len > pmtu) {
+        LLOG(LLOG_WARNING, "relay: invalid fragment sizes pmtu=%u len=%u", pmtu, frag_len);
+        return 0;
+    }
+    if ((uint32_t)LC_FRAG_HEADER_LEN + (uint32_t)frag_len > len) {
+        LLOG(LLOG_WARNING, "relay: invalid fragment payload recv=%u need=%u", len, (uint32_t)LC_FRAG_HEADER_LEN + (uint32_t)frag_len);
+        return 0;
+    }
+    if ((uint32_t)pmtu * (uint32_t)part_num + (uint32_t)frag_len > sizeof(frags[0].buffer)) {
+        LLOG(LLOG_WARNING, "relay: fragment out of bounds part=%u pmtu=%u len=%u", part_num, pmtu, frag_len);
+        return 0;
+    }
 
     struct lan_client_fragment *frag = NULL;
     int i;
@@ -223,12 +249,12 @@ static int lan_client_process_frag(struct lan_play *lp,
     }
 
     if (pmtu > 0 && (size_t)(pmtu * part_num + frag_len) <= ETHER_MTU) {
-        frag->part |= (uint8_t)(1 << part_num);
+        frag->part |= (uint8_t)(1u << part_num);
         memcpy(&frag->buffer[pmtu * part_num],
                packet + LC_FRAG_HEADER_LEN, frag_len);
         if (part_num == total_part - 1)
             frag->total_len = (uint16_t)((total_part - 1) * pmtu + frag_len);
-        if ((uint8_t)(~(~0u << total_part)) == frag->part) {
+        if (((uint8_t)((1u << total_part) - 1u)) == frag->part) {
             frag->used = 0;
             return lan_client_process(lp, frag->buffer, frag->total_len);
         }
@@ -309,6 +335,11 @@ void lan_client_recv_thread_fn(void *arg)
                         LLOG(LLOG_ERROR, "relay: recvfrom error (%d): %s (fd=%d)",
                              err_count, strerror(errno), fd);
                     }
+                    /* Suspend or broken network (sleep transition) */
+                    svcSleepThread(500000000LL); /* 500ms delay */
+                    if (err == ENETDOWN || err == EPIPE || err == ENXIO) {
+                        lp->running = false;
+                    }
                 }
             }
             continue;
@@ -377,6 +408,11 @@ void lan_client_keepalive_thread_fn(void *arg)
                 for (int i = 0; i < 10 && lp->running; i++)
                     svcSleepThread(1000000000LL);
                 continue;
+            } else if (err == ENETDOWN || err == EPIPE || err == ENXIO) {
+                /* Network suspended completely (sleep or interface down) */
+                LLOG(LLOG_ERROR, "relay: keepalive hard error %d, tearing down", err);
+                lp->running = false;
+                break;
             }
 
             consecutive_fails++;

@@ -25,6 +25,9 @@ int list_interfaces(pcap_if_t *alldevs)
             bool  first = true;
             for (taddr = d->addresses; taddr; taddr = taddr->next)
             {
+                if (!taddr->addr) {
+                    continue;
+                }
                 sin = (struct sockaddr_in *)taddr->addr;
                 if (sin->sin_family == AF_INET) {
                     strncpy(revIP, inet_ntoa(sin->sin_addr), sizeof(revIP));
@@ -129,18 +132,14 @@ int parse_arguments(int argc, char **argv)
             CHECK_PARAM();
             options.socks5_server_addr = argv[i + 1];
             i++;
-        // } else if (!strcmp(arg, "--socks5-username")) {
-        //     CHECK_PARAM();
-        //     options.socks5_username = argv[i + 1];
-        //     i++;
-        // } else if (!strcmp(arg, "--socks5-password")) {
-        //     CHECK_PARAM();
-        //     options.socks5_password = argv[i + 1];
-        //     i++;
-        // } else if (!strcmp(arg, "--socks5-password-file")) {
-        //     CHECK_PARAM();
-        //     options.socks5_password_file = argv[i + 1];
-        //     i++;
+        } else if (!strcmp(arg, "--socks5-username")) {
+            CHECK_PARAM();
+            options.socks5_username = argv[i + 1];
+            i++;
+        } else if (!strcmp(arg, "--socks5-password")) {
+            CHECK_PARAM();
+            options.socks5_password = argv[i + 1];
+            i++;
         } else if (!strcmp(arg, "--list-if")) {
             options.list_if = true;
         } else if (!strcmp(arg, "--broadcast")) {
@@ -229,6 +228,8 @@ void print_help(const char *name)
         "        [--list-if]\n"
         "        [--pmtu <pmtu>]\n"
         "        [--socks5-server-addr <addr>]\n"
+        "        [--socks5-username <username>]\n"
+        "        [--socks5-password <password>]\n"
         "        [--rpc <address>]\n"
         "        [--rpc-token <token>]\n"
         "        [--rpc-protocol <rpc protocol>]\n"

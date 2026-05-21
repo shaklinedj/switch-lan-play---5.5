@@ -108,6 +108,13 @@ namespace ams::mitm::ldn {
         }
 
         LogFormat("[GATEDBG] Initialize: lanDiscovery.initialize OK");
+        Result gate_prepare_rc = notify_gate_verbose("Initialize",
+                                 LanPlayGateEvent::Prepare,
+                                 this->client_process_id,
+                                 this->client_title_id,
+                                 0,
+                                 0);
+        AMS_UNUSED(gate_prepare_rc);
         LogFormat("[GATEDBG] ICommunicationService::Initialize exit success");
 
         return ResultSuccess();
@@ -257,6 +264,22 @@ namespace ams::mitm::ldn {
 
         rc = lanDiscovery.scan(buffer.GetPointer(), &count, filter);
         outCount.SetValue(count);
+
+        if (R_SUCCEEDED(rc)) {
+            u64 local_communication_id = 0;
+            u16 scene_id = 0;
+            if (this->gate_intent_valid) {
+                local_communication_id = this->gate_intent_id.localCommunicationId;
+                scene_id = this->gate_intent_id.sceneId;
+            }
+            Result gate_scan_rc = notify_gate_verbose("Scan",
+                                                      LanPlayGateEvent::Scan,
+                                                      this->client_process_id,
+                                                      this->client_title_id,
+                                                      local_communication_id,
+                                                      scene_id);
+            AMS_UNUSED(gate_scan_rc);
+        }
 
         LogFormat("scan %d %d", count, rc);
 

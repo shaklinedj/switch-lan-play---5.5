@@ -1,18 +1,42 @@
+/*
+ * ldn_gate.cpp — sysmodule polls ldn_mitm's "lanp:gt" service for LDN state.
+ *
+ * Role inversion: ldn_mitm now HOSTS "lanp:gt". This sysmodule calls
+ * smGetService("lanp:gt") from plain C context (no Stratosphere reentrancy),
+ * which works reliably. Polling happens once per second in the waiting loop.
+ *
+ * IPC protocol (must match ldn_mitm/source/ldn_gate_client.cpp):
+ *   cmd 0  GetState → returns lanp_gate_state_t
+ */
 #include "ldn_gate.h"
 
-#define LANP_GATE_CMD_NOTIFY 0
-#define LANP_GATE_CMD_GET_STATE 1
-#define LANP_GATE_CMD_CLEAR 2
+/* IPC command IDs — must match GateCmdGetState/GateCmdGetEvent in ldn_gate_client.cpp */
+#define LANP_GATE_CMD_GET_STATE 0
+#define LANP_GATE_CMD_GET_EVENT 1
 
-static Handle g_gate_port = INVALID_HANDLE;
-static Thread g_gate_thread;
-static uint8_t g_gate_stack[0x4000] __attribute__((aligned(0x1000)));
 static Mutex g_gate_mutex;
-static volatile bool g_gate_running = false;
-static bool g_gate_mutex_ready = false;
-static bool g_gate_thread_started = false;
-static bool g_gate_registered = false;
+static bool  g_gate_mutex_ready = false;
 static lanp_gate_state_t g_gate_state;
+
+/* IPC session to ldn_mitm's lanp:gt service */
+static Service g_mitm_srv;
+static bool    g_mitm_connected = false;
+
+/* Event handle received from ldn_mitm for push notifications.
+ * INVALID_HANDLE = not acquired yet or unsupported → fall back to polling. */
+static Handle  g_gate_event_handle = INVALID_HANDLE;
+
+/* Local sysmodule timestamp of the last time we received a non-finalize,
+ * non-none active event from ldn_mitm. Uses the sysmodule's own tick counter
+ * so we never compare ticks across process boundaries (armGetSystemTick in
+ * ldn_mitm reads cntvct_el0; svcGetSystemTick in the sysmodule reads
+ * cntpct_el0 — they can differ). */
+static u64 g_last_active_tick = 0;
+
+/* Timestamp when finalize was first observed — for the 10s grace period.
+ * Allows the relay to stay alive if the user briefly exits to the home menu
+ * and returns to local play quickly. */
+static u64 g_finalize_tick = 0;
 
 static u64 gate_now_tick(void)
 {
@@ -42,36 +66,6 @@ static void gate_reset_state_locked(void)
     g_gate_state.last_event_tick = gate_now_tick();
 }
 
-static void gate_apply_event_locked(const lanp_gate_event_t *ev)
-{
-    if (!ev || ev->magic != LANP_GATE_MAGIC || ev->version != LANP_GATE_VERSION) {
-        return;
-    }
-
-    g_gate_state.magic = LANP_GATE_MAGIC;
-    g_gate_state.version = LANP_GATE_VERSION;
-    g_gate_state.event_type = ev->event_type;
-    g_gate_state.process_id = ev->process_id;
-    g_gate_state.title_id = ev->title_id;
-    g_gate_state.local_communication_id = ev->local_communication_id;
-    g_gate_state.scene_id = ev->scene_id;
-    g_gate_state.last_event_tick = gate_now_tick();
-
-    switch (ev->event_type) {
-    case LANP_GATE_EVENT_PREPARE:
-    case LANP_GATE_EVENT_SCAN:
-    case LANP_GATE_EVENT_HOST:
-    case LANP_GATE_EVENT_CONNECT:
-        g_gate_state.active = 1;
-        break;
-    case LANP_GATE_EVENT_IDLE:
-    case LANP_GATE_EVENT_FINALIZE:
-    default:
-        g_gate_state.active = 0;
-        break;
-    }
-}
-
 void ldn_gate_get_state(lanp_gate_state_t *out)
 {
     if (!out) return;
@@ -86,228 +80,180 @@ bool ldn_gate_is_active(void)
     ldn_gate_get_state(&st);
 
     if (st.magic != LANP_GATE_MAGIC || st.version != LANP_GATE_VERSION) return false;
-    if (!st.active) return false;
 
-    const u64 now = gate_now_tick();
-    const u64 timeout_ticks = LANP_GATE_TICKS_PER_SECOND * (u64)LANP_GATE_TIMEOUT_SECONDS;
-    if (now >= st.last_event_tick && (now - st.last_event_tick) > timeout_ticks) {
+    /* Host or Connect = game is actively using LDN (hosting lobby or joined).
+     * Keep running indefinitely — no timeout applies. ldn_mitm won't send
+     * periodic scan/idle events in these states. */
+    if (st.event_type == LANP_GATE_EVENT_HOST ||
+        st.event_type == LANP_GATE_EVENT_CONNECT) {
+        return true;
+    }
+
+    /* Finalize = game exited local play.
+     * Grace period: keep relay alive 10s so a quick home-menu detour doesn't
+     * require a full restart cycle. */
+    if (st.event_type == LANP_GATE_EVENT_FINALIZE) {
+        if (g_finalize_tick != 0) {
+            const u64 grace = LANP_GATE_TICKS_PER_SECOND * 10ULL;
+            if (gate_now_tick() - g_finalize_tick <= grace) return true;
+        }
         return false;
     }
+
+    /* Never seen any activity yet */
+    if (g_last_active_tick == 0) return false;
+
+    /* Keep running while recent active events arrive. */
+    const u64 now = gate_now_tick();
+    const u64 timeout_ticks = LANP_GATE_TICKS_PER_SECOND * (u64)LANP_GATE_TIMEOUT_SECONDS;
+    if (now - g_last_active_tick > timeout_ticks) return false;
+
     return true;
 }
 
-static void gate_make_response(Result result, const void *out_data, size_t out_size)
+/* Strict check used by wait_for_ldn_activity() — NO grace period.
+ * Finalize always blocks a start; only genuine new activity (PREPARE/SCAN/etc)
+ * triggers a fresh run_service(). Prevents spurious restarts during the grace
+ * window after a game closes. */
+bool ldn_gate_is_active_for_start(void)
 {
-    void *base = armGetTls();
-    memset(base, 0, 0x100);
+    lanp_gate_state_t st;
+    ldn_gate_get_state(&st);
 
-    const u32 payload_size = (u32)(sizeof(CmifOutHeader) + out_size);
-    const u32 num_words = (u32)((16 + payload_size + 3) / 4);
-    HipcRequest hipc = hipcMakeRequestInline(base,
-        .type = 0,
-        .num_data_words = num_words
-    );
+    if (st.magic != LANP_GATE_MAGIC || st.version != LANP_GATE_VERSION) return false;
+    if (st.event_type == LANP_GATE_EVENT_FINALIZE) return false;
+    if (g_last_active_tick == 0) return false;
 
-    CmifOutHeader *hdr = (CmifOutHeader *)cmifGetAlignedDataStart(hipc.data_words, base);
-    hdr->magic = CMIF_OUT_HEADER_MAGIC;
-    hdr->version = 0;
-    hdr->result = result;
-    hdr->token = 0;
+    const u64 now = gate_now_tick();
+    const u64 timeout_ticks = LANP_GATE_TICKS_PER_SECOND * (u64)LANP_GATE_TIMEOUT_SECONDS;
+    if (now - g_last_active_tick > timeout_ticks) return false;
 
-    if (out_data && out_size > 0) {
-        memcpy(hdr + 1, out_data, out_size);
-    }
+    return true;
 }
 
-static void gate_process_request(bool *close_session)
+void ldn_gate_poll(void)
 {
-    *close_session = false;
-
-    HipcParsedRequest hipc = hipcParseRequest(armGetTls());
-
-    if (hipc.meta.type == CmifCommandType_Close) {
-        gate_make_response(0, NULL, 0);
-        *close_session = true;
-        return;
-    }
-
-    if (hipc.meta.type != CmifCommandType_Request &&
-        hipc.meta.type != CmifCommandType_RequestWithContext) {
-        gate_make_response(MAKERESULT(Module_Libnx, LibnxError_BadInput), NULL, 0);
-        return;
-    }
-
-    CmifInHeader *hdr = (CmifInHeader *)cmifGetAlignedDataStart(hipc.data.data_words, armGetTls());
-    if (!hdr || hdr->magic != CMIF_IN_HEADER_MAGIC) {
-        gate_make_response(MAKERESULT(Module_Libnx, LibnxError_BadInput), NULL, 0);
-        return;
-    }
-
-    void *in_data = hdr + 1;
-
-    switch (hdr->command_id) {
-    case LANP_GATE_CMD_NOTIFY: {
-        lanp_gate_event_t ev;
-        memset(&ev, 0, sizeof(ev));
-        memcpy(&ev, in_data, sizeof(ev));
-
-        if (g_gate_mutex_ready) mutexLock(&g_gate_mutex);
-        gate_apply_event_locked(&ev);
-        lanp_gate_state_t snapshot = g_gate_state;
-        if (g_gate_mutex_ready) mutexUnlock(&g_gate_mutex);
-
-        LLOG(LLOG_INFO, "ldn_gate: event=%s active=%u pid=%llu title=%016llX intent=%llu scene=%u",
-             ldn_gate_event_name(snapshot.event_type), snapshot.active,
-             (unsigned long long)snapshot.process_id,
-             (unsigned long long)snapshot.title_id,
-             (unsigned long long)snapshot.local_communication_id,
-             snapshot.scene_id);
-
-        gate_make_response(0, NULL, 0);
-        break;
-    }
-    case LANP_GATE_CMD_GET_STATE: {
-        lanp_gate_state_t st;
-        ldn_gate_get_state(&st);
-        gate_make_response(0, &st, sizeof(st));
-        break;
-    }
-    case LANP_GATE_CMD_CLEAR: {
-        if (g_gate_mutex_ready) mutexLock(&g_gate_mutex);
-        gate_reset_state_locked();
-        if (g_gate_mutex_ready) mutexUnlock(&g_gate_mutex);
-        gate_make_response(0, NULL, 0);
-        break;
-    }
-    default:
-        gate_make_response(MAKERESULT(Module_Libnx, LibnxError_BadInput), NULL, 0);
-        break;
-    }
-}
-
-static void gate_server_thread_fn(void *arg)
-{
-    (void)arg;
-    Handle session = INVALID_HANDLE;
-    Handle reply_target = INVALID_HANDLE;
-    bool close_after_reply = false;
-
-    LLOG(LLOG_INFO, "ldn_gate: server thread started");
-
-    while (g_gate_running) {
-        Handle handles[2];
-        s32 handle_count = 0;
-        handles[handle_count++] = g_gate_port;
-        if (session != INVALID_HANDLE) {
-            handles[handle_count++] = session;
+    /* Connect to ldn_mitm's lanp:gt service on first call (or after disconnect).
+     * smGetService() requires an open SM session; open/close it here because
+     * __appInit calls smExit() before the polling loop runs. */
+    if (!g_mitm_connected) {
+        Result sm_rc = smInitialize();
+        if (R_FAILED(sm_rc)) {
+            LLOG(LLOG_INFO, "ldn_gate: smInitialize failed rc=0x%x", sm_rc);
+            return;
         }
-
-        s32 index = -1;
-        Result rc = svcReplyAndReceive(&index, handles, handle_count, reply_target, 1000000000ULL);
-
-        if (close_after_reply && reply_target != INVALID_HANDLE) {
-            svcCloseHandle(reply_target);
-            if (session == reply_target) session = INVALID_HANDLE;
-            close_after_reply = false;
-        }
-        reply_target = INVALID_HANDLE;
-
+        Result rc = smGetService(&g_mitm_srv, LANP_GATE_SERVICE_NAME);
+        smExit();
         if (R_FAILED(rc)) {
-            continue;
+            LLOG(LLOG_INFO, "ldn_gate: smGetService(%s) failed rc=0x%x", LANP_GATE_SERVICE_NAME, rc);
+            return;
         }
+        g_mitm_connected = true;
+        LLOG(LLOG_INFO, "ldn_gate: connected to ldn_mitm %s service", LANP_GATE_SERVICE_NAME);
 
-        if (index == 0) {
-            Handle new_session = INVALID_HANDLE;
-            rc = svcAcceptSession(&new_session, g_gate_port);
-            if (R_SUCCEEDED(rc)) {
-                if (session == INVALID_HANDLE) {
-                    session = new_session;
-                } else {
-                    /* Single-client service: reject extra concurrent sessions. */
-                    svcCloseHandle(new_session);
-                }
+        /* Try to acquire the event handle (cmd 1) for push notifications.
+         * If ldn_mitm doesn't support it, we stay in poll-only mode. */
+        if (g_gate_event_handle == INVALID_HANDLE) {
+            Handle tmp_handle = INVALID_HANDLE;
+            Result ev_rc = serviceDispatch(&g_mitm_srv, LANP_GATE_CMD_GET_EVENT,
+                .out_handle_attrs = { SfOutHandleAttr_HipcCopy },
+                .out_handles = &tmp_handle,
+            );
+            if (R_SUCCEEDED(ev_rc) && tmp_handle != INVALID_HANDLE) {
+                g_gate_event_handle = tmp_handle;
+                LLOG(LLOG_INFO, "ldn_gate: event handle acquired (0x%x) — event-driven mode", g_gate_event_handle);
+            } else {
+                LLOG(LLOG_INFO, "ldn_gate: event handle not available (rc=0x%x) — poll-only mode", ev_rc);
             }
-        } else if (index == 1 && session != INVALID_HANDLE) {
-            bool close_session = false;
-            gate_process_request(&close_session);
-            reply_target = session;
-            close_after_reply = close_session;
         }
     }
 
-    if (session != INVALID_HANDLE) svcCloseHandle(session);
+    /* Call GetState (cmd 0) and update local g_gate_state */
+    lanp_gate_state_t st;
+    memset(&st, 0, sizeof(st));
+    Result rc = serviceDispatchOut(&g_mitm_srv, LANP_GATE_CMD_GET_STATE, st);
+    if (R_FAILED(rc)) {
+        LLOG(LLOG_WARNING, "ldn_gate: GetState failed rc=0x%x — disconnecting", rc);
+        serviceClose(&g_mitm_srv);
+        memset(&g_mitm_srv, 0, sizeof(g_mitm_srv));
+        g_mitm_connected = false;
+        return;
+    }
+
+    if (st.magic == LANP_GATE_MAGIC && st.version == LANP_GATE_VERSION) {
+        /* Update local active timer whenever we see a non-finalize, non-none
+         * event.  IDLE (between scan cycles) also counts — it indicates the
+         * game is still actively using LDN.  The hosting timeout is handled
+         * separately: HOST/CONNECT return true unconditionally in
+         * ldn_gate_is_active(), so the timeout only applies to scan phases. */
+        if (st.event_type != LANP_GATE_EVENT_NONE &&
+            st.event_type != LANP_GATE_EVENT_FINALIZE) {
+            g_last_active_tick = gate_now_tick();
+            g_finalize_tick    = 0;  /* new activity clears the grace window */
+        }
+        /* Track when finalize is first seen (transition into finalize). */
+        if (st.event_type == LANP_GATE_EVENT_FINALIZE &&
+            g_gate_state.event_type != LANP_GATE_EVENT_FINALIZE) {
+            g_finalize_tick = gate_now_tick();
+        }
+        if (g_gate_mutex_ready) mutexLock(&g_gate_mutex);
+        g_gate_state = st;
+        if (g_gate_mutex_ready) mutexUnlock(&g_gate_mutex);
+    }
 }
 
 Result ldn_gate_service_init(void)
 {
-    if (g_gate_registered) return 0;
-
     mutexInit(&g_gate_mutex);
     g_gate_mutex_ready = true;
     mutexLock(&g_gate_mutex);
     gate_reset_state_locked();
     mutexUnlock(&g_gate_mutex);
 
-    Result rc = smRegisterService(&g_gate_port, smEncodeName(LANP_GATE_SERVICE_NAME), false, 4);
-    if (R_FAILED(rc)) {
-        LLOG(LLOG_WARNING, "ldn_gate: smRegisterService(%s) failed: 0x%x", LANP_GATE_SERVICE_NAME, rc);
-        g_gate_port = INVALID_HANDLE;
-        return rc;
-    }
+    memset(&g_mitm_srv, 0, sizeof(g_mitm_srv));
+    g_mitm_connected   = false;
+    g_last_active_tick = 0;
+    g_finalize_tick    = 0;
 
-    g_gate_running = true;
-    rc = threadCreate(&g_gate_thread, gate_server_thread_fn, NULL,
-                      g_gate_stack, sizeof(g_gate_stack), 30, -2);
-    if (R_FAILED(rc)) {
-        LLOG(LLOG_WARNING, "ldn_gate: threadCreate failed: 0x%x", rc);
-        g_gate_running = false;
-        smUnregisterService(smEncodeName(LANP_GATE_SERVICE_NAME));
-        svcCloseHandle(g_gate_port);
-        g_gate_port = INVALID_HANDLE;
-        return rc;
-    }
-
-    rc = threadStart(&g_gate_thread);
-    if (R_FAILED(rc)) {
-        LLOG(LLOG_WARNING, "ldn_gate: threadStart failed: 0x%x", rc);
-        g_gate_running = false;
-        threadClose(&g_gate_thread);
-        smUnregisterService(smEncodeName(LANP_GATE_SERVICE_NAME));
-        svcCloseHandle(g_gate_port);
-        g_gate_port = INVALID_HANDLE;
-        return rc;
-    }
-
-    g_gate_thread_started = true;
-    g_gate_registered = true;
-    LLOG(LLOG_INFO, "ldn_gate: service %s registered", LANP_GATE_SERVICE_NAME);
+    /* No service registration here — ldn_mitm hosts lanp:gt now.
+     * Return success unconditionally; polling will connect lazily. */
     return 0;
 }
 
 void ldn_gate_service_exit(void)
 {
-    if (!g_gate_registered) return;
+    if (g_gate_event_handle != INVALID_HANDLE) {
+        svcCloseHandle(g_gate_event_handle);
+        g_gate_event_handle = INVALID_HANDLE;
+    }
+    if (g_mitm_connected) {
+        serviceClose(&g_mitm_srv);
+        memset(&g_mitm_srv, 0, sizeof(g_mitm_srv));
+        g_mitm_connected = false;
+    }
+}
 
-    g_gate_running = false;
-    if (g_gate_thread_started) {
-        threadWaitForExit(&g_gate_thread);
-        threadClose(&g_gate_thread);
-        g_gate_thread_started = false;
+bool ldn_gate_wait_event(u64 timeout_ns)
+{
+    if (g_gate_event_handle == INVALID_HANDLE) {
+        /* No event handle — fall back to a simple sleep so callers
+         * can use the same code path for both modes. */
+        svcSleepThread((s64)timeout_ns);
+        return false;
     }
 
-    bool sm_ready = R_SUCCEEDED(smInitialize());
-    if (sm_ready) {
-        smUnregisterService(smEncodeName(LANP_GATE_SERVICE_NAME));
-        smExit();
-    }
-    if (g_gate_port != INVALID_HANDLE) {
-        svcCloseHandle(g_gate_port);
-        g_gate_port = INVALID_HANDLE;
-    }
-    g_gate_registered = false;
+    /* Clear any pending signal BEFORE waiting. Horizon events are "sticky":
+     * if ldn_mitm signaled multiple times while we were busy (e.g., scan→
+     * idle→finalize), the event stays signaled.  Without this reset,
+     * svcWaitSynchronization would return immediately in a busy-loop. */
+    svcResetSignal(g_gate_event_handle);
+
+    Result rc = svcWaitSynchronizationSingle(g_gate_event_handle, (s64)timeout_ns);
+    return R_SUCCEEDED(rc);
 }
 
 bool ldn_gate_service_available(void)
 {
-    return g_gate_registered;
+    /* Always available: we poll lazily, no registration needed */
+    return true;
 }

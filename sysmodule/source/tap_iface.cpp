@@ -103,14 +103,21 @@ int tap_init(struct lan_play *lp)
 
 void tap_close(struct lan_play *lp)
 {
-    if (lp->bpf_fd >= 0) {
-        close(lp->bpf_fd);
-        lp->bpf_fd = -1;
+    LLOG(LLOG_INFO, "tap_close: Closing TAP interface...");
+    int bpf_fd = lp->bpf_fd;
+    lp->bpf_fd = -1;
+    if (bpf_fd >= 0) {
+        close(bpf_fd);
+        LLOG(LLOG_INFO, "tap_close: Closed bpf_fd=%d", bpf_fd);
     }
-    if (g_inject_fd >= 0) {
-        close(g_inject_fd);
-        g_inject_fd = -1;
+
+    int inject_fd = g_inject_fd;
+    g_inject_fd = -1;
+    if (inject_fd >= 0) {
+        close(inject_fd);
+        LLOG(LLOG_INFO, "tap_close: Closed inject_fd=%d", inject_fd);
     }
+    LLOG(LLOG_INFO, "tap_close: TAP interface closed.");
 }
 
 int tap_send_packet(struct lan_play *lp, const void *eth_frame, int len)
@@ -156,26 +163,44 @@ int tap_send_packet(struct lan_play *lp, const void *eth_frame, int len)
         }
 
         /* === LDN Bridge: packets targeting port 11452 are LDN traffic ===
-         * Route them through the bridge injection which broadcasts to
-         * ldn_mitm with proper IP rewriting. */
-        if (dst_port == LDN_GAME_PORT && payload_len >= 12) {
-            static int ldn_in_count = 0;
-            const struct ldn_packet_header *ldn_hdr = (const struct ldn_packet_header *)udp_payload;
-            if (++ldn_in_count <= 8) {
-                char src_ip_str[16] = {0};
-                struct in_addr src_ip;
-                memcpy(&src_ip, ip_pkt + 12, 4);
-                inet_ntop(AF_INET, &src_ip, src_ip_str, sizeof(src_ip_str));
-                LLOG(LLOG_INFO,
-                     "tap: relay->ldn candidate src=%s:%u dst=%u len=%d magic=%08x type=%u",
-                     src_ip_str, src_port, dst_port, payload_len, ldn_hdr->magic, ldn_hdr->type);
+         *
+         * Two sub-cases based on the source port:
+         *   src=11453 → TCP-tunnelled stream data from a remote peer.
+         *               Deliver it into the matching active TCP session
+         *               so ldn_mitm receives it on its TCP socket.
+         *   src=11452 → Normal UDP LDN packet (Scan, ScanResp, …).
+         *               Broadcast as UDP so ldn_mitm picks it up.
+         */
+        if (dst_port == LDN_GAME_PORT && payload_len >= 4) {
+            uint32_t src_ip_ho;
+            memcpy(&src_ip_ho, ip_pkt + 12, 4);
+            src_ip_ho = ntohl(src_ip_ho);
+
+            if (src_port == LDN_BRIDGE_PORT) {
+                /* TCP-tunnelled data: write into the session for this peer */
+                ldn_bridge_tcp_inject_from_relay(src_ip_ho, udp_payload, payload_len);
+                return 0;
             }
-            /* Rewrite IPs in incoming relay packets before injection */
-            /* (incoming = false: don't modify remote IPs, they're virtual) */
-            int ret = ldn_bridge_inject(lp, udp_payload, payload_len, src_port);
-            if (ret == 0) return 0; /* Handled by bridge */
-            /* Fall through to generic injection if bridge failed */
+
+            if (payload_len >= 12) {
+                static int ldn_in_count = 0;
+                const struct ldn_packet_header *ldn_hdr =
+                    (const struct ldn_packet_header *)udp_payload;
+                if (++ldn_in_count <= 8) {
+                    char src_ip_str[16] = {0};
+                    struct in_addr src_ip_s;
+                    memcpy(&src_ip_s, ip_pkt + 12, 4);
+                    inet_ntop(AF_INET, &src_ip_s, src_ip_str, sizeof(src_ip_str));
+                    LLOG(LLOG_INFO,
+                         "tap: relay->ldn candidate src=%s:%u dst=%u len=%d magic=%08x type=%u",
+                         src_ip_str, src_port, dst_port, payload_len,
+                         ldn_hdr->magic, ldn_hdr->type);
+                }
+                int ret = ldn_bridge_inject(lp, udp_payload, payload_len, src_port);
+                if (ret == 0) return 0;
+            }
         }
+
 
         if (g_inject_fd < 0) return -1;
 
@@ -230,11 +255,10 @@ int tap_send_packet(struct lan_play *lp, const void *eth_frame, int len)
 void tap_recv_thread_fn(void *arg)
 {
     struct lan_play *lp = (struct lan_play *)arg;
+    LLOG(LLOG_INFO, "tap_recv_thread_fn: Starting receive thread...");
 
     /* Buffer: 14 bytes Ethernet header + up to TAP_BUF_SIZE IP payload */
     uint8_t frame_buf[ETHER_HEADER_LEN + TAP_BUF_SIZE];
-
-    LLOG(LLOG_INFO, "tap: receive thread started (fd=%d)", lp->bpf_fd);
 
     while (lp->running) {
         struct sockaddr_in src_addr;
@@ -246,6 +270,11 @@ void tap_recv_thread_fn(void *arg)
         if (n <= 0) {
             if (n < 0 && errno != EAGAIN && errno != ETIMEDOUT && errno != EINTR) {
                 LLOG(LLOG_ERROR, "tap: recvfrom error: %s", strerror(errno));
+                /* If the network is suspended (sleep) or broken, prevent CPU spin */
+                svcSleepThread(500000000LL); /* 500ms delay */
+                if (errno == ENETDOWN || errno == EPIPE || errno == ENXIO) {
+                    lp->running = false;
+                }
             }
             continue;
         }
@@ -283,5 +312,5 @@ void tap_recv_thread_fn(void *arg)
         get_packet(&lp->packet_ctx, &phdr, frame_buf);
     }
 
-    LLOG(LLOG_INFO, "tap: receive thread exiting");
+    LLOG(LLOG_INFO, "tap_recv_thread_fn: Receive thread exiting.");
 }

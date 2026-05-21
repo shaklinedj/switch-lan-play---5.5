@@ -69,6 +69,28 @@ static int g_bridge_inject_fd = -1;
 /* TCP listening socket for relay proxy (port 11453) */
 static int g_bridge_tcp_fd = -1;
 
+/* ------------------------------------------------------------------ */
+/*  Concurrent TCP session table (one slot per remote LDN node, max 8) */
+/* ------------------------------------------------------------------ */
+
+#define TCP_SESSION_MAX  8                 /* LDN max node count */
+#define TCP_SESSION_STACK (20 * 1024)      /* stack per session thread */
+
+struct TcpSession {
+    volatile bool   active;      /* true while the thread is alive */
+    bool            thread_created; /* true if the thread has been created and needs to be closed */
+    int             client_fd;   /* TCP fd to local ldn_mitm */
+    uint32_t        target_ip;   /* remote virtual IP (host byte order) */
+    Mutex           write_mtx;   /* serialize writes back to ldn_mitm */
+    Thread          thread;
+    uint8_t         stack[TCP_SESSION_STACK];
+    struct lan_play *lp;
+};
+
+static TcpSession g_sessions[TCP_SESSION_MAX];
+static Mutex      g_sessions_mtx;
+static bool       g_sessions_ready = false;
+
 /* Track our WiFi IP so we can detect our own packets for rewriting */
 static uint32_t g_wifi_ip = 0; /* host byte order */
 
@@ -78,8 +100,8 @@ static uint32_t g_wifi_ip = 0; /* host byte order */
  * legacy relay protocol. Disable by creating:
  *   sdmc:/config/lan-play/disable_lobby_cache
  */
-#define LOBBY_CACHE_SIZE 8
-#define LOBBY_REINJECT_INTERVAL_NS 3000000000ULL
+#define LOBBY_CACHE_SIZE 16
+#define LOBBY_REINJECT_INTERVAL_NS 500000000ULL /* 500ms — must fit within ldn_mitm 1s scan window */
 #define LOBBY_EXPIRY_NS            30000000000ULL
 
 struct cached_lobby {
@@ -296,8 +318,8 @@ void ldn_bridge_rewrite_ips(struct lan_play *lp, void *ldn_data, int len,
             int off = NI_NODES_OFFSET + (i * NI_NODE_SIZE);
             if (off + 4 > body_len) break;
 
-            uint32_t *ip_ptr = (uint32_t *)(body + off);
-            uint32_t ip_ho = *ip_ptr; /* host byte order in struct */
+            uint32_t ip_ho;
+            memcpy(&ip_ho, body + off, 4); /* host byte order in struct */
 
             if (outgoing) {
                 /* Outgoing: replace real WiFi IP → virtual 10.13.x.x */
@@ -305,7 +327,7 @@ void ldn_bridge_rewrite_ips(struct lan_play *lp, void *ldn_data, int len,
                     uint32_t virtual_ip;
                     memcpy(&virtual_ip, lp->my_ip, 4);
                     virtual_ip = ntohl(virtual_ip);
-                    *ip_ptr = virtual_ip;
+                    memcpy(body + off, &virtual_ip, 4);
                     static bool logged = false;
                     if (!logged) {
                         LLOG(LLOG_INFO, "ldn_bridge: ALG rewrite WiFi IP %08x → virtual %08x",
@@ -321,11 +343,13 @@ void ldn_bridge_rewrite_ips(struct lan_play *lp, void *ldn_data, int len,
     } else if (hdr->type == LDN_TYPE_CONNECT) {
         /* Body is NodeInfo — rewrite single node's IP */
         if (body_len < 4) return;
-        uint32_t *ip_ptr = (uint32_t *)body;
-        if (outgoing && *ip_ptr == g_wifi_ip && g_wifi_ip != 0) {
+        uint32_t ip_ho;
+        memcpy(&ip_ho, body, 4);
+        if (outgoing && ip_ho == g_wifi_ip && g_wifi_ip != 0) {
             uint32_t virtual_ip;
             memcpy(&virtual_ip, lp->my_ip, 4);
-            *ip_ptr = ntohl(virtual_ip);
+            virtual_ip = ntohl(virtual_ip);
+            memcpy(body, &virtual_ip, 4);
         }
     }
 }
@@ -408,9 +432,58 @@ int ldn_bridge_init(struct lan_play *lp)
 void ldn_bridge_close(struct lan_play *lp)
 {
     (void)lp;
-    if (g_bridge_udp_fd >= 0) { close(g_bridge_udp_fd);    g_bridge_udp_fd = -1; }
-    if (g_bridge_inject_fd >= 0) { close(g_bridge_inject_fd); g_bridge_inject_fd = -1; }
-    if (g_bridge_tcp_fd >= 0) { close(g_bridge_tcp_fd);    g_bridge_tcp_fd = -1; }
+    if (g_bridge_udp_fd >= 0) {
+        close(g_bridge_udp_fd);
+        g_bridge_udp_fd = -1;
+    }
+    if (g_bridge_inject_fd >= 0) {
+        close(g_bridge_inject_fd);
+        g_bridge_inject_fd = -1;
+    }
+
+    /* Snapshot active client fds under mutex (brief — just copies ints),
+     * then close them OUTSIDE the mutex.
+     * This keeps the PSC fast-path non-blocking: even if inject_from_relay
+     * currently holds g_sessions_mtx the lock contention is microseconds,
+     * not the duration of shutdown()/close() syscalls. */
+    if (g_sessions_ready) {
+        int snap_fds[TCP_SESSION_MAX];
+        int snap_n = 0;
+
+        mutexLock(&g_sessions_mtx);
+        for (int i = 0; i < TCP_SESSION_MAX; i++) {
+            if (g_sessions[i].client_fd >= 0) {
+                snap_fds[snap_n++] = g_sessions[i].client_fd;
+                g_sessions[i].client_fd = -1; /* mark invalid immediately */
+            }
+        }
+        mutexUnlock(&g_sessions_mtx); /* released before any syscall */
+
+        for (int i = 0; i < snap_n; i++) {
+            shutdown(snap_fds[i], SHUT_RDWR); /* TCP client — safe */
+            close(snap_fds[i]);
+        }
+    }
+
+    /* Close the listening socket.  Do NOT call shutdown() on a server
+     * (listening) socket — that triggers OMM panics on Horizon OS. */
+    if (g_bridge_tcp_fd >= 0) {
+        close(g_bridge_tcp_fd);
+        g_bridge_tcp_fd = -1;
+    }
+}
+
+void ldn_bridge_wait_sessions(void)
+{
+    if (!g_sessions_ready) return;
+    for (int i = 0; i < TCP_SESSION_MAX; i++) {
+        if (g_sessions[i].thread_created) {
+            threadWaitForExit(&g_sessions[i].thread);
+            threadClose(&g_sessions[i].thread);
+            g_sessions[i].thread_created = false;
+            /* active is already cleared by the session thread itself */
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -529,6 +602,10 @@ void ldn_bridge_udp_thread_fn(void *arg)
         if (n <= 0) {
             if (n < 0 && errno != EAGAIN && errno != ETIMEDOUT && errno != EINTR) {
                 LLOG(LLOG_ERROR, "ldn_bridge: recvfrom error: %s", strerror(errno));
+                svcSleepThread(500000000LL); /* 500ms delay */
+                if (errno == ENETDOWN || errno == EPIPE || errno == ENXIO) {
+                    lp->running = false;
+                }
             }
             continue;
         }
@@ -576,43 +653,47 @@ void ldn_bridge_udp_thread_fn(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/*  TCP proxy thread: ldn_mitm <→ relay <→ remote ldn_mitm              */
-/*                                                                      */
-/*  When ldn_mitm connects to 127.0.0.1:11453 (via_relay path), it     */
-/*  sends a 4-byte target IP prefix.  We then tunnel the TCP data      */
-/*  as relay packets to/from that target.                               */
-/*                                                                      */
-/*  TCP data is encapsulated as:                                        */
-/*    relay TYPE_IPV4 → IP(proto=TCP) + TCP-like header + payload      */
-/*  This is a simplified tunnel: we use UDP relay packets that carry    */
-/*  the TCP stream data reliably enough for LDN (which is itself a     */
-/*  protocol with its own framing).                                     */
+/*  TCP inject: relay → local ldn_mitm (reverse direction)              */
 /* ------------------------------------------------------------------ */
 
-/* Simple TCP relay: forward data between local ldn_mitm and the relay
- * server.  Each TCP connection gets its own goroutine-like handler. */
-
-static void tcp_proxy_handle_client(struct lan_play *lp, int client_fd)
+void ldn_bridge_tcp_inject_from_relay(uint32_t src_ip_ho, const void *data, int len)
 {
-    /* Read 4-byte target IP (big-endian, host byte order value) */
-    uint32_t target_ip_be;
-    ssize_t r = recv(client_fd, &target_ip_be, 4, MSG_WAITALL);
-    if (r != 4) {
-        LLOG(LLOG_ERROR, "ldn_bridge: TCP proxy - failed to read target IP");
-        close(client_fd);
+    if (!g_sessions_ready || len <= 0) return;
+
+    mutexLock(&g_sessions_mtx);
+    for (int i = 0; i < TCP_SESSION_MAX; i++) {
+        if (!g_sessions[i].active) continue;
+        if (g_sessions[i].target_ip != src_ip_ho) continue;
+
+        int fd = g_sessions[i].client_fd;
+        if (fd < 0) break;
+
+        mutexLock(&g_sessions[i].write_mtx);
+        mutexUnlock(&g_sessions_mtx);  /* unlock table while writing */
+
+        ssize_t sent = 0;
+        const uint8_t *ptr = (const uint8_t *)data;
+        while (sent < len) {
+            ssize_t n = send(fd, ptr + sent, (size_t)(len - sent), 0);
+            if (n <= 0) break;
+            sent += n;
+        }
+        mutexUnlock(&g_sessions[i].write_mtx);
         return;
     }
+    mutexUnlock(&g_sessions_mtx);
+}
 
-    uint32_t target_ip_ho = ntohl(target_ip_be);
-    LLOG(LLOG_INFO, "ldn_bridge: TCP proxy client, target=%08x", target_ip_ho);
+/* ------------------------------------------------------------------ */
+/*  TCP session thread: one per active remote peer                      */
+/* ------------------------------------------------------------------ */
 
-    /* For now, we encapsulate each TCP chunk as a UDP relay packet.
-     * The relay server will forward it to the target virtual IP.
-     * The remote sysmodule will extract and deliver to remote ldn_mitm. */
-
-    /* Set receive timeout on client socket */
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+static void tcp_session_thread_fn(void *arg)
+{
+    TcpSession *sess = (TcpSession *)arg;
+    struct lan_play *lp  = sess->lp;
+    int      client_fd   = sess->client_fd;
+    uint32_t target_ip   = sess->target_ip;
 
     uint8_t buf[2048];
     uint8_t ip_pkt[2048 + 28];
@@ -621,45 +702,74 @@ static void tcp_proxy_handle_client(struct lan_play *lp, int client_fd)
     memcpy(&my_virtual_ip, lp->my_ip, 4);
     my_virtual_ip = ntohl(my_virtual_ip);
 
+    /* 1-second recv timeout so lp->running is checked periodically */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     while (lp->running) {
         ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
         if (n <= 0) {
-            if (n == 0) break; /* Connection closed */
+            if (n == 0) break; /* peer closed */
             if (errno == EAGAIN || errno == ETIMEDOUT || errno == EINTR) continue;
             break;
         }
 
-        /* Rewrite IPs in the LDN data being sent */
+        /* Rewrite embedded IPs (WiFi → virtual) before forwarding */
         ldn_bridge_rewrite_ips(lp, buf, (int)n, true);
 
         /* Wrap as IP/UDP and send to relay.
-         * Use TCP port 11452 as dst_port to indicate this is TCP-tunneled data */
+         * src_port = 11453 is the TCP-tunnel marker that the remote
+         * sysmodule uses to call ldn_bridge_tcp_inject_from_relay(). */
         int pkt_len = build_ip_udp(ip_pkt, sizeof(ip_pkt),
-                                   my_virtual_ip, target_ip_ho,
-                                   LDN_GAME_PORT + 1, /* src=11453 as marker for TCP */
-                                   LDN_GAME_PORT,
+                                   my_virtual_ip, target_ip,
+                                   LDN_BRIDGE_PORT,   /* src = 11453 (TCP marker) */
+                                   LDN_GAME_PORT,     /* dst = 11452 */
                                    buf, (int)n);
         if (pkt_len > 0) {
             lan_client_send_ipv4(lp, ip_pkt + 16, ip_pkt, (uint16_t)pkt_len);
         }
     }
 
-    LLOG(LLOG_INFO, "ldn_bridge: TCP proxy client disconnected");
+    LLOG(LLOG_INFO, "ldn_bridge: TCP session %08x ended", target_ip);
+
+    /* Mark slot free BEFORE closing fd so inject_from_relay stops writing */
+    mutexLock(&g_sessions_mtx);
+    sess->active    = false;
+    sess->client_fd = -1;
+    mutexUnlock(&g_sessions_mtx);
+
     close(client_fd);
 }
+
+/* ------------------------------------------------------------------ */
+/*  TCP proxy accept thread: ldn_mitm → relay → remote ldn_mitm         */
+/* ------------------------------------------------------------------ */
 
 void ldn_bridge_tcp_thread_fn(void *arg)
 {
     struct lan_play *lp = (struct lan_play *)arg;
+
+    /* Initialise session table once */
+    if (!g_sessions_ready) {
+        mutexInit(&g_sessions_mtx);
+        for (int i = 0; i < TCP_SESSION_MAX; i++) {
+            g_sessions[i].active    = false;
+            g_sessions[i].thread_created = false;
+            g_sessions[i].client_fd = -1;
+            mutexInit(&g_sessions[i].write_mtx);
+        }
+        g_sessions_ready = true;
+    }
 
     if (g_bridge_tcp_fd < 0) {
         LLOG(LLOG_WARNING, "ldn_bridge: TCP proxy not available (no socket)");
         return;
     }
 
-    LLOG(LLOG_INFO, "ldn_bridge: TCP proxy thread started (fd=%d)", g_bridge_tcp_fd);
+    LLOG(LLOG_INFO, "ldn_bridge: TCP proxy thread started (fd=%d, max=%d sessions)",
+         g_bridge_tcp_fd, TCP_SESSION_MAX);
 
-    /* Set accept timeout so we can check lp->running */
+    /* accept() timeout so lp->running is polled */
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(g_bridge_tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -671,10 +781,7 @@ void ldn_bridge_tcp_thread_fn(void *arg)
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == ETIMEDOUT || errno == EINTR) continue;
             if (errno == ECONNABORTED) {
-                /* On Horizon, accept() may return ECONNABORTED instead of
-                 * EAGAIN when the SO_RCVTIMEO expires.  Sleep to avoid
-                 * flooding the log when no real client is connecting. */
-                svcSleepThread(500000000LL); /* 500 ms */
+                svcSleepThread(500000000LL);
                 continue;
             }
             LLOG(LLOG_ERROR, "ldn_bridge: accept failed: %s", strerror(errno));
@@ -682,10 +789,61 @@ void ldn_bridge_tcp_thread_fn(void *arg)
             continue;
         }
 
-        LLOG(LLOG_INFO, "ldn_bridge: TCP proxy accepted fd=%d", client_fd);
+        /* Read 4-byte target IP sent by ldn_mitm before the stream starts */
+        uint32_t target_ip_be;
+        ssize_t r = recv(client_fd, &target_ip_be, 4, MSG_WAITALL);
+        if (r != 4) {
+            LLOG(LLOG_ERROR, "ldn_bridge: TCP proxy - failed to read target IP");
+            close(client_fd);
+            continue;
+        }
+        uint32_t target_ip_ho = ntohl(target_ip_be);
 
-        /* Handle synchronously (ldn_mitm only makes 1 TCP connection at a time) */
-        tcp_proxy_handle_client(lp, client_fd);
+        /* Find a free session slot */
+        mutexLock(&g_sessions_mtx);
+        int slot = -1;
+        for (int i = 0; i < TCP_SESSION_MAX; i++) {
+            if (!g_sessions[i].active) { slot = i; break; }
+        }
+
+        if (slot < 0) {
+            mutexUnlock(&g_sessions_mtx);
+            LLOG(LLOG_WARNING, "ldn_bridge: TCP session table full — dropping connection");
+            close(client_fd);
+            continue;
+        }
+
+        if (g_sessions[slot].thread_created) {
+            threadWaitForExit(&g_sessions[slot].thread);
+            threadClose(&g_sessions[slot].thread);
+            g_sessions[slot].thread_created = false;
+        }
+
+        g_sessions[slot].active    = true;
+        g_sessions[slot].client_fd = client_fd;
+        g_sessions[slot].target_ip = target_ip_ho;
+        g_sessions[slot].lp        = lp;
+        mutexUnlock(&g_sessions_mtx);
+
+        LLOG(LLOG_INFO, "ldn_bridge: TCP session slot=%d target=%08x", slot, target_ip_ho);
+
+        Result rc = threadCreate(&g_sessions[slot].thread,
+                                 tcp_session_thread_fn,
+                                 &g_sessions[slot],
+                                 g_sessions[slot].stack,
+                                 TCP_SESSION_STACK,
+                                 31, -2);
+        if (R_FAILED(rc)) {
+            LLOG(LLOG_ERROR, "ldn_bridge: threadCreate failed for slot=%d rc=0x%x", slot, rc);
+            mutexLock(&g_sessions_mtx);
+            g_sessions[slot].active    = false;
+            g_sessions[slot].client_fd = -1;
+            mutexUnlock(&g_sessions_mtx);
+            close(client_fd);
+            continue;
+        }
+        g_sessions[slot].thread_created = true;
+        threadStart(&g_sessions[slot].thread);
     }
 
     LLOG(LLOG_INFO, "ldn_bridge: TCP proxy thread exiting");

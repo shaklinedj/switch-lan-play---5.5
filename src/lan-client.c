@@ -82,7 +82,7 @@ int lan_client_init(struct lan_play *lan_play)
     } else {
         if (lan_play->server_addr.sin_family == AF_INET6) {
             struct sockaddr_in6 temp;
-            uv_ip6_addr("0.0.0.0", 0, &temp);
+            uv_ip6_addr("::", 0, &temp);
             ret = uv_udp_bind(client, (struct sockaddr *)&temp, 0);
             if (ret != 0) {
                 LLOG(LLOG_ERROR, "uv_udp_bind v6 %d", ret);
@@ -156,6 +156,7 @@ int lan_client_close(struct lan_play *lan_play)
 
     uv_close((uv_handle_t *)&lan_play->client, NULL);
     uv_close((uv_handle_t *)&lan_play->client_keepalive_timer, NULL);
+    uv_close((uv_handle_t *)&lan_play->real_broadcast_timer, NULL);
 
     return 0;
 }
@@ -252,6 +253,11 @@ int lan_client_process(struct lan_play *lan_play, const uint8_t *packet, uint16_
 int lan_client_process_frag(struct lan_play *lan_play, const uint8_t *packet, uint16_t len)
 {
 
+    if (len < LC_FRAG_HEADER_LEN) {
+        LLOG(LLOG_WARNING, "invalid fragment: length %u < header", len);
+        return 0;
+    }
+
     struct lan_client_fragment *frags = lan_play->frags;
     struct lan_client_fragment_header header;
     CPY_IPV4(header.src, packet + LC_FRAG_SRC);
@@ -261,6 +267,27 @@ int lan_client_process_frag(struct lan_play *lan_play, const uint8_t *packet, ui
     header.total_part = READ_NET8(packet, LC_FRAG_TOTAL_PART);
     header.len = READ_NET16(packet, LC_FRAG_LEN);
     header.pmtu = READ_NET16(packet, LC_FRAG_PMTU);
+
+    if (header.total_part == 0 || header.total_part > 8) {
+        LLOG(LLOG_WARNING, "invalid fragment total_part: %u", header.total_part);
+        return 0;
+    }
+    if (header.part >= header.total_part) {
+        LLOG(LLOG_WARNING, "invalid fragment index: part=%u total=%u", header.part, header.total_part);
+        return 0;
+    }
+    if (header.pmtu == 0 || header.len > header.pmtu) {
+        LLOG(LLOG_WARNING, "invalid fragment sizes: pmtu=%u len=%u", header.pmtu, header.len);
+        return 0;
+    }
+    if ((uint32_t)LC_FRAG_HEADER_LEN + (uint32_t)header.len > len) {
+        LLOG(LLOG_WARNING, "invalid fragment payload length: recv=%u need=%u", len, (uint32_t)LC_FRAG_HEADER_LEN + (uint32_t)header.len);
+        return 0;
+    }
+    if ((uint32_t)header.pmtu * (uint32_t)header.part + (uint32_t)header.len > sizeof(frags[0].buffer)) {
+        LLOG(LLOG_WARNING, "fragment out of bounds: part=%u pmtu=%u len=%u", header.part, header.pmtu, header.len);
+        return 0;
+    }
 
     // LLOG(LLOG_DEBUG, "lan_client_process_frag %d:%d/%d", header.id, header.part, header.total_part);
     struct lan_client_fragment *frag = NULL;
@@ -312,12 +339,12 @@ int lan_client_process_frag(struct lan_play *lan_play, const uint8_t *packet, ui
     }
 
     if (frag) {
-        frag->part |= 1 << header.part;
+        frag->part |= (uint8_t)(1u << header.part);
         memcpy(&frag->buffer[header.pmtu * header.part], packet + LC_FRAG_HEADER_LEN, header.len);
         if (header.part == header.total_part - 1) {
             frag->total_len = (header.total_part - 1) * header.pmtu + header.len;
         }
-        if (~(~0 << header.total_part) == frag->part) {
+        if (((uint8_t)((1u << header.total_part) - 1u)) == frag->part) {
             // LLOG(LLOG_DEBUG, "fragment finish %d, origin len %d", frag->id, frag->total_len);
             // finish
             frag->used = 0;

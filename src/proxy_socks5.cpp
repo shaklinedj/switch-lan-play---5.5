@@ -121,7 +121,8 @@ class Socks5Protocol {
             UnexpectMethod,
             UnexpectResponse,
             UnexpectAddressType,
-            UnexpectLength
+            UnexpectLength,
+            CredentialTooLong
         };
         using ReadyCallback = std::function<void(std::shared_ptr<uvw::TCPHandle> tcp)>;
         using UDPReadyCallback = std::function<void(struct sockaddr_in addr)>;
@@ -142,19 +143,49 @@ class Socks5Protocol {
             tcp->connect(cfg.server.u.addr);
             tcp->once<uvw::ConnectEvent>([this](uvw::ConnectEvent &e, uvw::TCPHandle &) {
                 tcp->read();
-                ProtocolPacker packer{3};
+                bool useAuth = !cfg.username.empty();
+                size_t methodCount = useAuth ? 2 : 1;
+                ProtocolPacker packer{2 + methodCount};
                 packer.writeUint8(5);
-                packer.writeUint8(1);
+                packer.writeUint8(static_cast<uint8_t>(methodCount));
                 packer.writeUint8(0);
+                if (useAuth) {
+                    packer.writeUint8(2);
+                }
                 tcp->write(packer.ptr(), packer.length);
             });
             tcp->once<uvw::DataEvent>([cb, this](uvw::DataEvent &e, uvw::TCPHandle &) {
                 RASSERT(e.length == 2, ErrCode::UnexpectLength);
-                char version = e.data[0];
-                char method = e.data[1];
+                uint8_t version = e.data[0];
+                uint8_t method = e.data[1];
                 RASSERT(version == 5, ErrCode::VersionMismatch);
-                RASSERT(method == 0, ErrCode::UnexpectMethod);
-                cb();
+                if (method == 0) {
+                    cb();
+                    return;
+                }
+                if (method == 2) {
+                    RASSERT(cfg.username.length() <= 255 && cfg.password.length() <= 255, ErrCode::CredentialTooLong);
+                    ProtocolPacker authReq{3 + cfg.username.length() + cfg.password.length()};
+                    authReq.writeUint8(1);
+                    authReq.writeUint8(static_cast<uint8_t>(cfg.username.length()));
+                    authReq.writeRaw(cfg.username.data(), cfg.username.length());
+                    authReq.writeUint8(static_cast<uint8_t>(cfg.password.length()));
+                    authReq.writeRaw(cfg.password.data(), cfg.password.length());
+
+                    tcp->once<uvw::DataEvent>([cb, this](uvw::DataEvent &authResp, uvw::TCPHandle &) {
+                        RASSERT(authResp.length == 2, ErrCode::UnexpectLength);
+                        uint8_t authVersion = authResp.data[0];
+                        uint8_t authStatus = authResp.data[1];
+                        RASSERT(authVersion == 1, ErrCode::VersionMismatch);
+                        RASSERT(authStatus == 0, ErrCode::UnexpectResponse);
+                        cb();
+                    });
+
+                    tcp->write(authReq.ptr(), authReq.length);
+                    return;
+                }
+
+                RASSERT(false, ErrCode::UnexpectMethod);
             });
         }
         std::shared_ptr<uvw::TCPHandle> tcp;

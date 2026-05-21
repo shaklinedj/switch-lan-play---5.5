@@ -37,7 +37,19 @@ void *str2ip(const char *ip)
     static uint8_t bin[4];
     int p[4];
     int i;
-    sscanf(ip, "%d.%d.%d.%d", &p[0], &p[1], &p[2], &p[3]);
+
+    if (!ip || sscanf(ip, "%d.%d.%d.%d", &p[0], &p[1], &p[2], &p[3]) != 4) {
+        memset(bin, 0, sizeof(bin));
+        return bin;
+    }
+
+    for (i = 0; i < 4; i++) {
+        if (p[i] < 0 || p[i] > 255) {
+            memset(bin, 0, sizeof(bin));
+            return bin;
+        }
+    }
+
     for (i=0; i<4; i++) {
         bin[i] = p[i];
     }
@@ -247,19 +259,23 @@ done:
 
 int parse_ip_port(const char *str, char *out_addr, size_t out_addr_len, uint16_t *out_port, uint8_t *is_ipv6)
 {
-    int len = strlen(str);
+    if (!str || !out_addr || !out_port || !is_ipv6 || out_addr_len == 0) {
+        return -1;
+    }
+
+    size_t len = strlen(str);
     if (len < 1 || len > 1000) {
         return -1;
     }
 
-    int addr_start;
-    int addr_len;
-    int port_start;
-    int port_len;
+    size_t addr_start;
+    size_t addr_len;
+    size_t port_start;
+    size_t port_len;
 
     if (str[0] == '[') {
         *is_ipv6 = 1;
-        int i=1;
+        size_t i = 1;
         while (i < len && str[i] != ']') i++;
         if (i >= len) {
             return -1;
@@ -273,8 +289,8 @@ int parse_ip_port(const char *str, char *out_addr, size_t out_addr_len, uint16_t
         port_len = len - port_start;
     } else {
         *is_ipv6 = 0;
-        // find ':'
-        int i=0;
+        // find first ':'
+        size_t i = 0;
         while (i < len && str[i] != ':') i++;
         if (i >= len) {
             // No port specified: use the entire string as address and default port
@@ -283,11 +299,19 @@ int parse_ip_port(const char *str, char *out_addr, size_t out_addr_len, uint16_t
             port_start = len;
             port_len = 0;
         } else {
+            // Reject unbracketed IPv6-like addresses (multiple ':').
+            if (strchr(str + i + 1, ':') != NULL) {
+                return -1;
+            }
             addr_start = 0;
             addr_len = i - addr_start;
             port_start = i + 1;
             port_len = len - port_start;
         }
+    }
+
+    if (addr_len == 0) {
+        return -1;
     }
 
     if (addr_len >= out_addr_len) {
@@ -315,7 +339,7 @@ int parse_ip_port(const char *str, char *out_addr, size_t out_addr_len, uint16_t
     if (port_str[0] == '\0' || *err != '\0') {
         return -1;
     }
-    if (conv_res < 0 || conv_res > UINT16_MAX) {
+    if (conv_res <= 0 || conv_res > UINT16_MAX) {
         return -1;
     }
     *out_port = conv_res;
@@ -324,6 +348,10 @@ int parse_ip_port(const char *str, char *out_addr, size_t out_addr_len, uint16_t
 
 int parse_addr(const char *str, struct slp_addr_in *addr)
 {
+    if (!str || !addr) {
+        return -1;
+    }
+
     char addr_str[128];
     uint16_t port;
     uint8_t is_ipv6;
@@ -342,9 +370,18 @@ int parse_addr(const char *str, struct slp_addr_in *addr)
 
     int ret = getaddrinfo(addr_str, NULL, &hints, &addrs);
     if (ret != 0) {
-        LLOG(LLOG_ERROR, "getaddrinfo %d %d", ret);
+        LLOG(LLOG_ERROR, "getaddrinfo failed: %d", ret);
         return -1;
     }
+
+    if (!addrs || !addrs->ai_addr) {
+        if (addrs) {
+            freeaddrinfo(addrs);
+        }
+        return -1;
+    }
+
+    memset(addr, 0, sizeof(*addr));
 
     addr->sin_family = addrs->ai_addr->sa_family;
     if (addrs->ai_addr->sa_family == AF_INET) {

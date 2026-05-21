@@ -237,7 +237,7 @@ int LanSocket::compress(const void *input, size_t input_size, uint8_t *output, s
         uint8_t count = 0;
 
         if (c == 0) {
-            while (*in == 0 && in < in_end && count < 0xFF) {
+            while (in < in_end && *in == 0 && count < 0xFF) {
                 count += 1;
                 in++;
             }

@@ -1,6 +1,9 @@
 #define TESLA_INIT_IMPL // If you have more than one file using the tesla header, only define this in the main one
 #include <tesla.hpp>    // The Tesla Header
 #include "ldn.h"
+#include <sys/stat.h>
+#include <stdio.h>
+#include <unistd.h>
 
 enum class State {
     Uninit,
@@ -57,6 +60,28 @@ public:
     }
 };
 
+class LanPlayLoggingToggleListItem : public tsl::elm::ToggleListItem {
+public:
+    LanPlayLoggingToggleListItem() : ToggleListItem("Lan Play Logs", false) {
+        struct stat st;
+        bool logs_enabled = (stat("sdmc:/config/lan-play/disable_logging", &st) != 0);
+        this->setState(logs_enabled);
+
+        this->setStateChangedListener([](bool enabled) {
+            if (enabled) {
+                remove("sdmc:/config/lan-play/disable_logging");
+            } else {
+                mkdir("sdmc:/config", 0777);
+                mkdir("sdmc:/config/lan-play", 0777);
+                FILE *f = fopen("sdmc:/config/lan-play/disable_logging", "w");
+                if (f) {
+                    fclose(f);
+                }
+            }
+        });
+    }
+};
+
 class MainGui : public tsl::Gui {
 public:
     MainGui() { }
@@ -73,6 +98,7 @@ public:
         } else {
             list->addItem(new EnabledToggleListItem());
             list->addItem(new LoggingToggleListItem());
+            list->addItem(new LanPlayLoggingToggleListItem());
         }
 
         frame->setContent(list);

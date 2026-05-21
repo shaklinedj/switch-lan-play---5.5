@@ -9,7 +9,7 @@ extern "C" {
 #define LANP_GATE_SERVICE_NAME "lanp:gt"
 #define LANP_GATE_MAGIC 0x47504E4CUL /* 'LNPG' little-endian */
 #define LANP_GATE_VERSION 1
-#define LANP_GATE_TIMEOUT_SECONDS 30
+#define LANP_GATE_TIMEOUT_SECONDS 120
 #define LANP_GATE_TICKS_PER_SECOND 19200000ULL
 
 typedef enum {
@@ -19,6 +19,7 @@ typedef enum {
     LANP_GATE_EVENT_CONNECT = 3,
     LANP_GATE_EVENT_IDLE = 4,
     LANP_GATE_EVENT_FINALIZE = 5,
+    LANP_GATE_EVENT_PREPARE = 6,
 } lanp_gate_event_type_t;
 
 typedef struct {
@@ -51,8 +52,11 @@ typedef struct {
 Result ldn_gate_service_init(void);
 void   ldn_gate_service_exit(void);
 bool   ldn_gate_service_available(void);
+void   ldn_gate_poll(void);            /* fetch current LDN state from ldn_mitm */
+bool   ldn_gate_wait_event(u64 timeout_ns); /* block until ldn_mitm signals a state change (true=signaled, false=timeout) */
 void   ldn_gate_get_state(lanp_gate_state_t *out);
-bool   ldn_gate_is_active(void);
+bool   ldn_gate_is_active(void);           /* keep-running check: 10s grace after finalize */
+bool   ldn_gate_is_active_for_start(void); /* start check: no grace, needs fresh event */
 const char *ldn_gate_event_name(u32 event_type);
 
 #ifdef __cplusplus

@@ -79,7 +79,7 @@ void parse_ipv4(const struct ether_frame *ether, struct ipv4 *ipv4)
     ipv4->fragment_offset = tt & 0x1fff;
     ipv4->ttl = READ_NET8(packet, IPV4_OFF_TTL);
     ipv4->protocol = READ_NET8(packet, IPV4_OFF_PROTOCOL);
-    ipv4->checksum = READ_NET16(packet, IPV4_OFF_PROTOCOL);
+    ipv4->checksum = READ_NET16(packet, IPV4_OFF_CHECKSUM);
     CPY_IPV4(ipv4->src, packet + IPV4_OFF_SRC);
     CPY_IPV4(ipv4->dst, packet + IPV4_OFF_DST);
     ipv4->payload = packet + ipv4->header_len;
@@ -88,7 +88,26 @@ void parse_ipv4(const struct ether_frame *ether, struct ipv4 *ipv4)
 int process_ipv4(struct packet_ctx *arg, const struct ether_frame *ether)
 {
     struct ipv4 ipv4;
+
+    if (ether->raw_len < ETHER_OFF_END + IPV4_OFF_END) {
+        return -1;
+    }
+
     parse_ipv4(ether, &ipv4);
+
+    if (ipv4.version != 4 || ipv4.header_len < IPV4_OFF_END) {
+        return -1;
+    }
+    if (ether->raw_len < ETHER_OFF_END + ipv4.header_len) {
+        return -1;
+    }
+    if (ipv4.total_len < ipv4.header_len) {
+        return -1;
+    }
+    if (ether->raw_len < ETHER_OFF_END + ipv4.total_len) {
+        return -1;
+    }
+
     arp_set(arg, ipv4.ether->src, ipv4.src);
 
     if (CMP_IPV4(ipv4.dst, arg->ip)) {

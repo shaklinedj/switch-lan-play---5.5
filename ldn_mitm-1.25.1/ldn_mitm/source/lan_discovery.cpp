@@ -10,6 +10,9 @@ namespace ams::mitm::ldn {
     static const int ModuleID = 0xFD;
     static const int LdnModuleId = 0xCB;
 
+    /* Static BSS stack for the worker thread – avoids custom-heap exhaustion. */
+    alignas(os::ThreadStackAlignment) static u8 s_worker_stack[StackSize];
+
     const char *LANDiscovery::FakeSsid = "12345678123456781234567812345678";
     const LANDiscovery::LanEventFunc LANDiscovery::EmptyFunc = [](){};
     const LANDiscovery::StateChangeFunc LANDiscovery::EmptyStateChangeFunc = [](CommState, CommState){};
@@ -844,16 +847,30 @@ namespace ams::mitm::ldn {
             return rc;
         }
 
-        rc = os::CreateThread(&this->workerThread, &Worker, this, reinterpret_cast<void *>(util::AlignUp(reinterpret_cast<uintptr_t>(stack.get()), os::ThreadStackAlignment)), StackSize, 0x15, 2);
+        LogFormat("LANDiscovery::initialize creating worker thread");
+        void *stack_base = static_cast<void *>(s_worker_stack);
+        LogFormat("LANDiscovery worker stack_base=%p size=0x%x alignment=0x%x", stack_base, StackSize, os::ThreadStackAlignment);
+        LogFormat("LANDiscovery calling os::CreateThread now");
+        rc = os::CreateThread(&this->workerThread,
+                              &Worker,
+                              this,
+                              stack_base,
+                              StackSize,
+                              0x15);
+        LogFormat("LANDiscovery os::CreateThread returned rc=0x%x", rc);
         if (R_FAILED(rc)) {
             LogFormat("LANDiscovery Failed to threadCreate: %x", rc);
             return 0xF601;
         }
 
+        LogFormat("LANDiscovery::initialize worker thread created");
         os::StartThread(&this->workerThread);
+        LogFormat("LANDiscovery::initialize worker thread started");
         this->setState(CommState::Initialized);
+        LogFormat("LANDiscovery::initialize state set initialized");
 
         this->initialized = true;
+        LogFormat("LANDiscovery::initialize complete");
         return 0;
     }
 }

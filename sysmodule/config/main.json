@@ -14,7 +14,7 @@
 	"filesystem_access":	{
 		"permissions":	"0xffffffffffffffff"
 	},
-	"service_access":	["*"],
+	"service_access":	["lanp:gt", "*"],
 	"service_host":	["*"],
 	"kernel_capabilities":	[{
 			"type":	"kernel_flags",

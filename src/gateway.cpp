@@ -160,6 +160,12 @@ struct gateway {
                     return -1;
                 }
                 uint16_t ipv4_header_len = (data[0] & 0xF) * 4;
+                if (ipv4_header_len < IPV4_OFF_END || ipv4_header_len > data_len) {
+                    return -1;
+                }
+                if (data_len < ipv4_header_len + UDP_OFF_END) {
+                    return -1;
+                }
                 const uint8_t *udp_base = data + ipv4_header_len;
                 uint8_t src[4];
                 uint8_t dst[4];
@@ -167,13 +173,23 @@ struct gateway {
                 uint16_t dstport;
                 const void *payload;
                 uint16_t len;
+                uint16_t udp_len = READ_NET16(udp_base, UDP_OFF_LENGTH);
+
+                if (udp_len < UDP_OFF_END) {
+                    return -1;
+                }
+
+                int udp_available_len = data_len - ipv4_header_len;
+                if (udp_len > udp_available_len) {
+                    return -1;
+                }
 
                 CPY_IPV4(src, data + IPV4_OFF_SRC);
                 CPY_IPV4(dst, data + IPV4_OFF_DST);
                 srcport = READ_NET16(udp_base, UDP_OFF_SRCPORT);
                 dstport = READ_NET16(udp_base, UDP_OFF_DSTPORT);
                 payload = udp_base + UDP_OFF_END;
-                len = data_len - ipv4_header_len - UDP_OFF_END;
+                len = udp_len - UDP_OFF_END;
 
                 this->proxy->udpSend(src, srcport, dst, dstport, payload, len);
                 return 0;
@@ -207,6 +223,9 @@ int gateway_close(struct gateway *gateway) {
 }
 
 void gateway_on_packet(struct gateway *gateway, const uint8_t *data, int data_len) {
+    if (data_len <= ETHER_OFF_END) {
+        return;
+    }
     data += ETHER_OFF_END;
     data_len -= ETHER_OFF_END;
     gateway->onPacket(data, data_len);

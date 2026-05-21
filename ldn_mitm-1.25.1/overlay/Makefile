@@ -37,7 +37,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   of a homebrew executable (.nro). This is intended to be used for sysmodules.
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET_VERSION := $(shell git describe --tags --dirty)
+TARGET_VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo unknown)
 VERSION_DEFINES	:= -DGITDESCVER="\"${TARGET_VERSION}\""
 
 APP_TITLE	:=	ldn_mitm
