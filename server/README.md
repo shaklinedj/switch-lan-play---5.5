@@ -24,8 +24,8 @@ sudo usermod -aG docker $USER
 # Log out and back in, then:
 
 # Clone the repo
-git clone https://github.com/shaklinedj/switch-lan-play
-cd switch-lan-play/server
+git clone https://github.com/shaklinedj/switch-lan-play---5.5
+cd switch-lan-play---5.5/server
 
 # Start the server
 docker compose up -d
@@ -72,8 +72,8 @@ sudo usermod -aG docker $USER
 newgrp docker
 
 # Clone & start
-git clone https://github.com/shaklinedj/switch-lan-play
-cd switch-lan-play/server
+git clone https://github.com/shaklinedj/switch-lan-play---5.5
+cd switch-lan-play---5.5/server
 docker compose up -d
 
 # Open the firewall
@@ -139,7 +139,7 @@ Players then set `username` and `password` in their `config.ini`.
 ## Updating
 
 ```sh
-cd switch-lan-play/server
+cd switch-lan-play---5.5/server
 git pull
 docker compose up -d --build
 ```

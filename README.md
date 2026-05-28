@@ -1,4 +1,4 @@
-﻿# switch-lan-play
+# switch-lan-play
 
 [![Chat en Discord](https://img.shields.io/badge/chat-en%20discord-7289da.svg)](https://discord.gg/zEMCu5n)
 
@@ -66,7 +66,7 @@ Cada Switch obtiene automaticamente una **IP virtual unica** en el rango `10.13.
 
 ### Paso 1 — Descargar
 
-Descarga `switch-lan-play-all-in-one-v1.14-rc1.zip` desde [Releases](https://github.com/shaklinedj/switch-lan-play/releases).
+Descarga `switch-lan-play-all-in-one-v1.14-rc1.zip` desde [Releases](https://github.com/shaklinedj/switch-lan-play---5.5/releases).
 
 ### Paso 2 — Copiar a la SD
 

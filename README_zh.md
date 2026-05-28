@@ -1,5 +1,5 @@
 # switch-lan-play
-[![Build status](https://github.com/shaklinedj/switch-lan-play/workflows/Build/badge.svg)](https://github.com/shaklinedj/switch-lan-play/actions?query=workflow%3ABuild)
+[![Build status](https://github.com/shaklinedj/switch-lan-play---5.5/workflows/Build/badge.svg)](https://github.com/shaklinedj/switch-lan-play---5.5/actions?query=workflow%3ABuild)
 [![Chat on discord](https://img.shields.io/badge/chat-on%20discord-7289da.svg)](https://discord.gg/zEMCu5n)
 
 [English](README.md) | 中文
@@ -28,7 +28,7 @@ Switch <-------->  PC(本工具)  <-------------------> 服务器
 
 2. 安装 Npcap 的时候记得选择 **Installed in WinPcap API-compatible mode** (以 WinPcap API 兼容模式安装)
 
-3. 从 [releases](https://github.com/shaklinedj/switch-lan-play/releases) 下载最新版 `lan-play.exe` 客户端
+3. 从 [releases](https://github.com/shaklinedj/switch-lan-play---5.5/releases) 下载最新版 `lan-play.exe` 客户端
 
 4. 运行 `lan-play.exe`
 
@@ -148,8 +148,8 @@ make
 ## Node
 
 ```sh
-git clone https://github.com/shaklinedj/switch-lan-play
-cd switch-lan-play/server
+git clone https://github.com/shaklinedj/switch-lan-play---5.5
+cd switch-lan-play---5.5/server
 npm install
 npm run build # build ts to js. run it again when code changed.
 npm start
