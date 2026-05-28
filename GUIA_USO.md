@@ -206,7 +206,7 @@ Copiá los archivos de esta manera:
 sdmc:/
 ├── atmosphere/
 │   └── contents/
-│       └── 010000000000FF01/
+│       └── 42000000000000B1/
 │           ├── exefs/
 │           │   ├── main          ← sysmodule NSO (ya compilado)
 │           │   └── main.npdm     ← permisos (ya compilado)

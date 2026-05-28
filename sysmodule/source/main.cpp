@@ -232,7 +232,35 @@ static int resolve_server(const char *addr_str, struct sockaddr_in *out)
         return 0;
     }
 
-    /* 2. hosts.txt fallback — instant, no network needed */
+    /* 2. Try DNS first (with 3 retries, short sleep) to support dynamic IPs (DDNS) */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    bool dns_success = false;
+    for (int retry = 0; retry < 3; retry++) {
+        int gai_err = getaddrinfo(host, NULL, &hints, &res);
+        if (gai_err == 0 && res) {
+            dns_success = true;
+            break;
+        }
+        LLOG(LLOG_WARNING, "main: DNS failed for '%s' (try %d/3): %s", host, retry + 1, gai_strerror(gai_err));
+        svcSleepThread(500000000ULL); // 500 ms sleep between retries
+    }
+
+    if (dns_success && res) {
+        memcpy(&out->sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(struct in_addr));
+        freeaddrinfo(res);
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &out->sin_addr, ip_str, sizeof(ip_str));
+        cache_host_mapping(host, ip_str);
+        LLOG(LLOG_INFO, "main: resolved '%s' -> %s:%d (DNS)", host, ip_str, port);
+        return 0;
+    }
+
+    /* 3. DNS failed: try hosts.txt fallback — instant, no network needed */
     if (resolve_from_hosts_file(host, &out->sin_addr) == 0) {
         char ip_str[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &out->sin_addr, ip_str, sizeof(ip_str));
@@ -240,7 +268,7 @@ static int resolve_server(const char *addr_str, struct sockaddr_in *out)
         return 0;
     }
 
-    /* 3. Built-in table fallback — instant, no network needed */
+    /* 4. DNS and hosts.txt failed: try built-in table fallback */
     if (resolve_from_builtin_fallback(host, &out->sin_addr) == 0) {
         char ip_str[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &out->sin_addr, ip_str, sizeof(ip_str));
@@ -248,32 +276,8 @@ static int resolve_server(const char *addr_str, struct sockaddr_in *out)
         return 0;
     }
 
-    /* 4. DNS — last resort, 3 retries only (avoids 10s wait on 90DNS) */
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    for (int retry = 0; retry < 3; retry++) {
-        int gai_err = getaddrinfo(host, NULL, &hints, &res);
-        if (gai_err == 0 && res) break;
-        LLOG(LLOG_WARNING, "main: DNS failed for '%s' (try %d/3): %s", host, retry + 1, gai_strerror(gai_err));
-        svcSleepThread(1000000000ULL);
-    }
-
-    if (!res) {
-        LLOG(LLOG_ERROR, "main: cannot resolve '%s' — use IP:port in config", host);
-        return -1;
-    }
-
-    memcpy(&out->sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(struct in_addr));
-    freeaddrinfo(res);
-
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &out->sin_addr, ip_str, sizeof(ip_str));
-    cache_host_mapping(host, ip_str);
-    LLOG(LLOG_INFO, "main: resolved '%s' -> %s:%d (DNS)", host, ip_str, port);
-    return 0;
+    LLOG(LLOG_ERROR, "main: cannot resolve '%s' — check connection or use direct IP:port", host);
+    return -1;
 }
 
 /* -------------------------------------------------------------------------
@@ -913,7 +917,7 @@ static bool wait_for_ldn_activity(void)
             Result app_rc = 0;
             if (!pgl_has_application(&app_pid, &app_event, &app_rc)) {
                 write_status_waiting_game(NULL);
-                if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
+                if (quiet_ticks == 0 || (quiet_ticks % 120) == 0) {
                     LLOG(LLOG_INFO, "pgl: waiting for application before LDN (last=%s rc=0x%x)",
                          pgl_process_event_name(app_event), app_rc);
                 }
@@ -945,7 +949,7 @@ static bool wait_for_ldn_activity(void)
         }
 
         write_status_waiting_ldn(NULL, &gate);
-        if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
+        if (quiet_ticks == 0 || (quiet_ticks % 120) == 0) {
             LLOG(LLOG_INFO, "ldn_gate: waiting for LDN activity (last=%s active=%u magic=0x%x)",
                  ldn_gate_event_name(gate.event_type), gate.active, gate.magic);
             if (R_SUCCEEDED(g_rc_fs)) fsdevCommitDevice("sdmc");
@@ -1038,7 +1042,7 @@ static bool wait_for_foreground_game(void)
         }
 
         write_status_waiting_game(&fg);
-        if (quiet_ticks < 5 || (quiet_ticks % 30) == 0) {
+        if (quiet_ticks == 0 || (quiet_ticks % 120) == 0) {
             LLOG(LLOG_INFO, "foreground: waiting for game (%s rc=0x%x)",
                  foreground_state_reason(&fg), fg.last_rc);
         }
@@ -1071,6 +1075,10 @@ static bool foreground_runtime_still_allowed(const char *phase)
 static int run_service(void)
 {
     g_sleep_teardown_requested = false;
+
+    /* Service loop counters — declared here to avoid C++ goto-crosses-init errors */
+    int service_loop_iter = 0;
+    uint64_t last_up_pkt = 0, last_dn_pkt = 0;
 
     if (R_SUCCEEDED(g_rc_fs)) ensure_tmp_dir();
 
@@ -1406,7 +1414,13 @@ static int run_service(void)
     /* ------------------------------------------------------------------ */
     /* 10. Service Loop (Restartable without reboot)                       */
     /* ------------------------------------------------------------------ */
+    service_loop_iter = 0;
+    last_up_pkt = 0;
+    last_dn_pkt = 0;
+
     while (true) {
+        service_loop_iter++;
+
         if (g_sleep_teardown_requested || !lp->running) {
             LLOG(LLOG_INFO, "runtime: sleep teardown requested, stopping service loop");
             write_status_error("Suspendiendo: cerrando red para modo reposo");
@@ -1416,6 +1430,8 @@ static int run_service(void)
         /* Write status for the Homebrew App to read */
         FILE *sf = fopen("sdmc:/tmp/lanplay.status", "w");
         if (sf) {
+            lanp_gate_state_t gst;
+            ldn_gate_get_state(&gst);
             fprintf(sf, "active=1\n");
             fprintf(sf, "error=\n");
             fprintf(sf, "relay=%s\n", cfg.relay_addr);
@@ -1423,7 +1439,29 @@ static int run_service(void)
             fprintf(sf, "up_bytes=%llu\n", (unsigned long long)lp->upload_byte);
             fprintf(sf, "dn_pkt=%llu\n", (unsigned long long)lp->download_packet);
             fprintf(sf, "dn_bytes=%llu\n", (unsigned long long)lp->download_byte);
+            fprintf(sf, "state=%s\n", ldn_gate_event_name(gst.event_type));
             fclose(sf);
+        }
+
+        /* Periodic traffic stats every 30s (15 * 2s iterations).
+         * Logs up/dn packets so we can diagnose silent sessions where
+         * the relay is connected but no game traffic flows. */
+        if (service_loop_iter % 15 == 1) {
+            uint64_t cur_up = lp->upload_packet;
+            uint64_t cur_dn = lp->download_packet;
+            lanp_gate_state_t gst2;
+            ldn_gate_get_state(&gst2);
+            LLOG(LLOG_INFO,
+                 "runtime: up=%llu (+%llu) dn=%llu (+%llu) pkts  send_err=%u recv_err=%u  ldn=%s",
+                 (unsigned long long)cur_up,
+                 (unsigned long long)(cur_up - last_up_pkt),
+                 (unsigned long long)cur_dn,
+                 (unsigned long long)(cur_dn - last_dn_pkt),
+                 lp->send_err_count,
+                 lp->recv_err_count,
+                 ldn_gate_event_name(gst2.event_type));
+            last_up_pkt = cur_up;
+            last_dn_pkt = cur_dn;
         }
 
         /* Check for reload trigger from the Homebrew App */
@@ -1453,6 +1491,7 @@ static int run_service(void)
 
         svcSleepThread(2000000000LL); /* 2 s check */
     }
+
 
     /* ------------------------------------------------------------------ */
     /* 11. Cleanup (before reload or exit)                                 */

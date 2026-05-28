@@ -324,6 +324,11 @@ struct lan_play {
     uint64_t upload_packet;
     uint64_t download_packet;
 
+    /* Per-runtime error counters — MUST live in struct (not as static locals)
+     * so they reset to 0 when the LAN runtime restarts after a failure. */
+    uint32_t send_err_count;  /* sendto() failures in relay_send_raw */
+    uint32_t recv_err_count;  /* recvfrom() failures in recv thread */
+
     /* Threading */
     Thread         relay_thread;
     Thread         tap_thread;

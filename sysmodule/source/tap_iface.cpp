@@ -201,7 +201,6 @@ int tap_send_packet(struct lan_play *lp, const void *eth_frame, int len)
             }
         }
 
-
         if (g_inject_fd < 0) return -1;
 
         /* Determine where to send:
@@ -260,9 +259,33 @@ void tap_recv_thread_fn(void *arg)
     /* Buffer: 14 bytes Ethernet header + up to TAP_BUF_SIZE IP payload */
     uint8_t frame_buf[ETHER_HEADER_LEN + TAP_BUF_SIZE];
 
+    /* Refresh our local WiFi IP periodically so the anti-echo filter stays
+     * correct even if the Switch reconnects to WiFi with a new IP address.
+     * The recvfrom() has a 1-second timeout (SO_RCVTIMEO), so we tick this
+     * counter at roughly 1 Hz without needing a separate timer thread. */
+    int wifi_refresh_ticks = 0;
+
     while (lp->running) {
         struct sockaddr_in src_addr;
         socklen_t addr_len = sizeof(src_addr);
+
+        /* Refresh WiFi IP every ~10 seconds (10 * 1s SO_RCVTIMEO timeouts) */
+        if (++wifi_refresh_ticks >= 10) {
+            wifi_refresh_ticks = 0;
+            u32 new_ip = 0;
+            if (R_SUCCEEDED(nifmGetCurrentIpAddress(&new_ip)) && new_ip != 0) {
+                if (new_ip != lp->wifi_ip) {
+                    char old_str[16], new_str[16];
+                    struct in_addr oa, na;
+                    oa.s_addr = lp->wifi_ip; na.s_addr = new_ip;
+                    inet_ntop(AF_INET, &oa, old_str, sizeof(old_str));
+                    inet_ntop(AF_INET, &na, new_str, sizeof(new_str));
+                    LLOG(LLOG_INFO, "tap: WiFi IP changed %s -> %s (anti-echo filter updated)",
+                         old_str, new_str);
+                    lp->wifi_ip = new_ip;
+                }
+            }
+        }
 
         ssize_t n = recvfrom(lp->bpf_fd, frame_buf + ETHER_HEADER_LEN,
                              TAP_BUF_SIZE, 0,

@@ -600,15 +600,25 @@ void ldn_bridge_udp_thread_fn(void *arg)
         ssize_t n = recvfrom(g_bridge_udp_fd, recv_buf, sizeof(recv_buf), 0,
                              (struct sockaddr *)&from, &from_len);
         if (n <= 0) {
-            if (n < 0 && errno != EAGAIN && errno != ETIMEDOUT && errno != EINTR) {
-                LLOG(LLOG_ERROR, "ldn_bridge: recvfrom error: %s", strerror(errno));
-                svcSleepThread(500000000LL); /* 500ms delay */
-                if (errno == ENETDOWN || errno == EPIPE || errno == ENXIO) {
-                    lp->running = false;
+            if (n < 0) {
+                int err = errno;
+                if (err == EAGAIN || err == ETIMEDOUT || err == EINTR) {
+                    /* Normal timeout — just loop */
+                } else if (err == EBADF) {
+                    /* Socket closed during shutdown — this is expected and benign */
+                    LLOG(LLOG_INFO, "ldn_bridge: UDP fd closed (EBADF) — thread exiting");
+                    break;
+                } else {
+                    LLOG(LLOG_ERROR, "ldn_bridge: recvfrom error: %s", strerror(err));
+                    svcSleepThread(500000000LL); /* 500ms delay */
+                    if (err == ENETDOWN || err == EPIPE || err == ENXIO) {
+                        lp->running = false;
+                    }
                 }
             }
             continue;
         }
+
 
         /* Verify LDN magic */
         if (n < LDN_HEADER_SIZE) continue;
@@ -774,6 +784,24 @@ void ldn_bridge_tcp_thread_fn(void *arg)
     setsockopt(g_bridge_tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     while (lp->running) {
+        struct pollfd pfd;
+        pfd.fd = g_bridge_tcp_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int pret = poll(&pfd, 1, 500); // 500 ms timeout
+        if (pret < 0) {
+            if (errno == EBADF) {
+                LLOG(LLOG_WARNING, "ldn_bridge: TCP poll EBADF — exiting thread");
+                break;
+            }
+            if (errno != EINTR) svcSleepThread(10000000LL);
+            continue;
+        }
+        if (pret == 0) {
+            continue;
+        }
+
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
 
