@@ -15,7 +15,7 @@
 10. Be direct.
 
 ## Technical Quick Ref
-- **Title ID**: `4200000000000011` (sysmodule), `4200000000000010` (ldn_mitm)
+- **Title ID**: `42000000000000B1` (sysmodule), `4200000000000010` (ldn_mitm)
 - **BPF raw-socket capture** → UDP relay tunnel (SLP protocol)
 - **NPDM**: Use stable from `final_v1.13/`, NOT npdmtool output
 - **Packaging**: `exefs.nsp` (build_pfs0) REQUIRED for Atmosphere boot2

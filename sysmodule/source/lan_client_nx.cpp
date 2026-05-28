@@ -52,14 +52,17 @@ static int relay_send_raw(struct lan_play *lp, const void *data, size_t len)
     mutexUnlock(&lp->mutex);
 
     if (sent < 0) {
-        /* Rate-limit error logs: only once every 30 failures */
-        static int err_count = 0;
-        if (++err_count <= 3 || (err_count % 30 == 0)) {
-            LLOG(LLOG_ERROR, "relay_send_raw: sendto failed (%d): %s",
-                 err_count, strerror(errno));
+        /* Rate-limit error logs: only once every 30 failures.
+         * Use lp->send_err_count (not a static local) so the counter
+         * resets properly when the runtime restarts. */
+        lp->send_err_count++;
+        if (lp->send_err_count <= 3 || (lp->send_err_count % 30 == 0)) {
+            LLOG(LLOG_ERROR, "relay_send_raw: sendto failed (%u): %s",
+                 lp->send_err_count, strerror(errno));
         }
         return -1;
     }
+    lp->send_err_count = 0; /* reset on success */
     lp->upload_packet++;
     lp->upload_byte += (uint64_t)len;
     return 0;
@@ -328,22 +331,26 @@ void lan_client_recv_thread_fn(void *arg)
                     LLOG(LLOG_WARNING, "relay: recvfrom EBADF on fd %d, socket closed, retrying", fd);
                     continue;
                 }
-                if (err != EAGAIN && err != EWOULDBLOCK && err != EINTR) {
-                    /* Rate-limit error logs: only once every 30 failures */
-                    static int err_count = 0;
-                    if (++err_count <= 3 || (err_count % 30 == 0)) {
-                        LLOG(LLOG_ERROR, "relay: recvfrom error (%d): %s (fd=%d)",
-                             err_count, strerror(errno), fd);
-                    }
-                    /* Suspend or broken network (sleep transition) */
-                    svcSleepThread(500000000LL); /* 500ms delay */
-                    if (err == ENETDOWN || err == EPIPE || err == ENXIO) {
-                        lp->running = false;
-                    }
+                /* EAGAIN/EWOULDBLOCK/ETIMEDOUT → normal timeout, just loop */
+                if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT || err == EINTR) {
+                    continue;
+                }
+                /* Real error — rate-limit logs using lp field so counter resets
+                 * on runtime restart (avoids silent error suppression after crash). */
+                lp->recv_err_count++;
+                if (lp->recv_err_count <= 3 || (lp->recv_err_count % 30 == 0)) {
+                    LLOG(LLOG_ERROR, "relay: recvfrom error (%u): %s (fd=%d)",
+                         lp->recv_err_count, strerror(err), fd);
+                }
+                /* Suspend or broken network (sleep transition) */
+                svcSleepThread(500000000LL); /* 500ms delay */
+                if (err == ENETDOWN || err == EPIPE || err == ENXIO) {
+                    lp->running = false;
                 }
             }
             continue;
         }
+        lp->recv_err_count = 0; /* reset on successful recv */
 
         lp->download_packet++;
         lp->download_byte += (uint64_t)n;
@@ -423,10 +430,11 @@ void lan_client_keepalive_thread_fn(void *arg)
              * state. A future runtime manager should restart the whole LAN
              * runtime instead of hot-swapping this shared socket. */
             if (consecutive_fails >= 6) {
-                LLOG(LLOG_WARNING,
-                     "relay: %d keepalive failures; keeping socket open and waiting for runtime restart",
+                LLOG(LLOG_ERROR,
+                     "relay: %d keepalive failures; tearing down LAN runtime for clean self-healing restart",
                      consecutive_fails);
-                consecutive_fails = 0;
+                lp->running = false;
+                break;
             }
         } else {
             if (consecutive_fails > 0) {
@@ -438,8 +446,10 @@ void lan_client_keepalive_thread_fn(void *arg)
         /* Also toggle next_real_broadcast so every 1 s we do a real broadcast */
         lp->next_real_broadcast = true;
 
-        /* Sleep for 10 seconds in 1-second chunks so we can terminate quickly on reboot/reload */
-        for (int i = 0; i < 10 && lp->running; i++) {
+        /* Sleep 15 seconds in 1-second chunks.
+         * 15s is safe for all common NAT/firewall UDP mapping timeouts (>= 30s)
+         * while being significantly less noisy than 10s. */
+        for (int i = 0; i < 15 && lp->running; i++) {
             svcSleepThread(1000000000LL); /* 1 second */
         }
     }
