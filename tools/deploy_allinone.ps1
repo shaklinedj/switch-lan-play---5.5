@@ -4,10 +4,10 @@ $root = Split-Path -Parent $PSScriptRoot
 
 # Mapeo origen -> destino
 $copies = @(
-    # lan-play: configurador, sysmodule y debug
+    # lan-play: configurador y sysmodule
     @{ src = "$root\hbapp\lanplay-setup.nro";                              dst = "$root\all_in_one\switch\lan-play\lanplay-setup.nro" },
-    @{ src = "$root\sysmodule\lanplay-sys-debug.nro";                      dst = "$root\all_in_one\switch\lan-play\lanplay-sys-debug.nro" },
-    @{ src = "$root\sysmodule\lanplay-debug.nro";                          dst = "$root\all_in_one\switch\lan-play\lanplay-debug.nro" },
+    # lan-play: archivo de configuración por defecto
+    @{ src = "$root\sysmodule\config.ini";                                 dst = "$root\all_in_one\config\lan-play\config.ini" },
     # lan-play sysmodule: usar siempre el paquete recién generado por `make atmosphere`.
     @{ src = "$root\sysmodule\atmosphere\contents\42000000000000B1\exefs.nsp"; dst = "$root\all_in_one\atmosphere\contents\42000000000000B1\exefs.nsp" },
 
