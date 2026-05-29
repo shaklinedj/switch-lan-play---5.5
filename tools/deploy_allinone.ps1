@@ -25,8 +25,8 @@ $copies = @(
     # ldn_mitm: configurador NRO
     @{ src = "$root\ldn_mitm-1.25.1\ldnmitm_config\ldnmitm_config.nro";   dst = "$root\all_in_one\switch\ldnmitm_config\ldnmitm_config.nro" },
 
-    # ldn_mitm: overlay (Tesla) - desde release oficial pre-compilado
-    @{ src = "C:\Users\Dell\Desktop\ldn_mitm_v1.25.1_release\switch\.overlays\ldnmitm_config.ovl"; dst = "$root\all_in_one\switch\.overlays\ldnmitm_config.ovl" }
+    # ldn_mitm: overlay (Tesla) - recién compilado localmente
+    @{ src = "$root\ldn_mitm-1.25.1\overlay\overlay.ovl"; dst = "$root\all_in_one\switch\.overlays\ldnmitm_config.ovl" }
 )
 
 foreach ($item in $copies) {

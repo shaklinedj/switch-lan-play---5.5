@@ -64,19 +64,19 @@ class LanPlayLoggingToggleListItem : public tsl::elm::ToggleListItem {
 public:
     LanPlayLoggingToggleListItem() : ToggleListItem("Lan Play Logs", false) {
         struct stat st;
-        bool logs_enabled = (stat("sdmc:/config/lan-play/disable_logging", &st) != 0);
+        bool logs_enabled = (stat("sdmc:/config/lan-play/enable_logging", &st) == 0);
         this->setState(logs_enabled);
 
         this->setStateChangedListener([](bool enabled) {
             if (enabled) {
-                remove("sdmc:/config/lan-play/disable_logging");
-            } else {
                 mkdir("sdmc:/config", 0777);
                 mkdir("sdmc:/config/lan-play", 0777);
-                FILE *f = fopen("sdmc:/config/lan-play/disable_logging", "w");
+                FILE *f = fopen("sdmc:/config/lan-play/enable_logging", "w");
                 if (f) {
                     fclose(f);
                 }
+            } else {
+                remove("sdmc:/config/lan-play/enable_logging");
             }
         });
     }

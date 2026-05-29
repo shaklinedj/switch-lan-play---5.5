@@ -146,7 +146,7 @@ static int resolve_from_builtin_fallback(const char *host, struct in_addr *out_a
 
 void nx_log(int level, const char *fmt, ...)
 {
-    static bool s_logging_disabled = false;
+    static bool s_logging_enabled = false;
     static bool s_verbose_logging = false;
     static u64 s_last_check_tick = 0;
     const u64 now_tick = svcGetSystemTick();
@@ -155,11 +155,11 @@ void nx_log(int level, const char *fmt, ...)
     if (s_last_check_tick == 0 || (now_tick - s_last_check_tick) >= (2 * LANP_GATE_TICKS_PER_SECOND)) {
         s_last_check_tick = now_tick;
         struct stat st;
-        s_logging_disabled = (stat("sdmc:/config/lan-play/disable_logging", &st) == 0);
+        s_logging_enabled = (stat("sdmc:/config/lan-play/enable_logging", &st) == 0);
         s_verbose_logging = (stat("sdmc:/config/lan-play/enable_verbose_logging", &st) == 0);
     }
 
-    if (s_logging_disabled) return;
+    if (!s_logging_enabled) return;
 
     int max_level = s_verbose_logging ? LLOG_DEBUG : LLOG_INFO;
     if (level > max_level) return;
