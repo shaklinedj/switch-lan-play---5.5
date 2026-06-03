@@ -64,9 +64,26 @@ jobs:
       with:
         name: lan-play-macos
         path: build/src/lan-play
+  build-nro:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build lanplay-setup.nro
+      working-directory: hbapp
+      run: make
+    - name: Upload NRO
+      uses: actions/upload-artifact@v4
+      with:
+        name: lanplay-setup-nro
+        path: hbapp/lanplay-setup.nro
   release:
     runs-on: ubuntu-latest
-    needs: [build-linux, build-windows, build-macos]
+    needs: [build-linux, build-windows, build-macos, build-nro]
+    permissions:
+      contents: write
 
     steps:
 ################################################################################
@@ -82,6 +99,10 @@ jobs:
       with:
         name: lan-play-macos
         path: lan-play-macos
+    - uses: actions/download-artifact@v4
+      with:
+        name: lanplay-setup-nro
+        path: lanplay-setup-nro
 ################################################################################
     - name: rename
       run: |
@@ -91,6 +112,8 @@ jobs:
     - name: Release
       uses: softprops/action-gh-release@v2
       with:
-        files: "**/lan-play-*"
+        files: |
+          **/lan-play-*
+          lanplay-setup-nro/lanplay-setup.nro
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

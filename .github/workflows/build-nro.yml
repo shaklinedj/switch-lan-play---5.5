@@ -1,0 +1,33 @@
+name: Build NRO
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'hbapp/**'
+
+jobs:
+  build-nro:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build lanplay-setup.nro
+        working-directory: hbapp
+        run: make
+
+      - name: Copy NRO to all_in_one
+        run: |
+          cp hbapp/lanplay-setup.nro all_in_one/switch/lan-play/lanplay-setup.nro
+          cp hbapp/lanplay-setup.nro hbapp/lanplay-setup.nro
+
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanplay-setup-nro
+          path: hbapp/lanplay-setup.nro
