@@ -66,7 +66,7 @@ Cada Switch obtiene automaticamente una **IP virtual unica** en el rango `10.13.
 
 ### Paso 1 — Descargar
 
-Descarga `switch-lan-play-all-in-one-v1.14-rc1.zip` desde [Releases](https://github.com/shaklinedj/switch-lan-play---5.5/releases).
+Descarga `switch-lan-play-all-in-one-v1.15.zip` desde [Releases](https://github.com/shaklinedj/switch-lan-play---5.5/releases).
 
 ### Paso 2 — Copiar a la SD
 
@@ -132,7 +132,7 @@ sdmc:/
 
 | Componente | Version | Title ID |
 |------------|---------|----------|
-| Sysmodule lan-play | v1.14 | `42000000000000B1` |
+| Sysmodule lan-play | v1.15 | `42000000000000B1` |
 | ldn_mitm (modificado) | v1.25.1 | `4200000000000010` |
 | Atmosphere requerido | >= 1.11.0 | -- |
 
