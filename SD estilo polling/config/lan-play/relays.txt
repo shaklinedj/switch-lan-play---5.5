@@ -1,10 +1,12 @@
-192.241.238.136:11451  # Servidor 1 — Nueva York, US
-65.21.20.230:11451     # Servidor 2 — Helsinki, FI
-89.163.151.130:11451   # Servidor 3 — Frankfurt, DE
-37.187.111.226:11451   # Servidor 4 — París, FR
-45.83.241.140:11451    # Servidor 5 — Ámsterdam, NL
-185.117.82.250:11451   # Servidor 6 — Europa
-37.201.39.187:11451    # Servidor 7 — Alemania, DE
-201.83.170.61:11451    # Servidor 8 — Brasil, BR
-91.195.240.12:11453    # Servidor 9 — Europa (puerto 11453)
-199.60.101.194:11451   # Servidor 10 — EE.UU., US
+192.241.238.136:11451  # tekn0.net EU
+65.21.20.230:11451     # lan.nonny.horse EU
+89.163.151.130:11451   # switch.servegame.com DK
+37.187.111.226:11451   # spain-slp.duckdns.org FR
+45.83.241.140:11451    # switch.jayseateam.nl NL
+45.83.241.140:11453    # switch.jayseateam.nl NL :11453
+185.117.82.250:11451   # games.initlab.org BG
+37.201.39.187:11451    # switch-lanyplay-de DE
+201.83.170.61:11451    # herbertfx.ddns.net BR
+91.195.240.12:11453    # switch.0mn1b0x.com AU
+199.60.101.194:11451   # joinsg.net US
+88.140.156.4:11451     # switch.lan-play.com EU FR

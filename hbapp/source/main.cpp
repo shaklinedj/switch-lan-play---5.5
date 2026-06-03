@@ -38,19 +38,34 @@ static void commit_sdmc(void);
 /*  Known relay IPs (pre-seed for offline use)                            */
 /* ═══════════════════════════════════════════════════════════════════════ */
 static const char *g_seed_relays[] = {
-    "88.140.156.4:11451",      /* switch.lan-play.com   EU FR */
-    "192.241.238.136:11451",   /* tekn0.net             EU    */
-    "65.21.20.230:11451",      /* lan.nonny.horse       EU    */
-    "45.83.241.140:11451",     /* switch.jayseateam.nl  NL    */
-    "45.83.241.140:11453",     /* switch.jayseateam.nl  NL    */
-    "91.195.240.12:11453",     /* switch.0mn1b0x.com    AU    */
-    "199.60.101.194:11451",    /* joinsg.net            US    */
-    "199.60.101.194:11453",    /* joinsg.net            US    */
-    "89.163.151.130:11451",    /* switch.servegame.com  DK    */
-    "37.187.111.226:11451",    /* spain-slp.duckdns.org FR    */
-    "185.117.82.250:11451",    /* games.initlab.org     BG    */
-    "37.201.39.187:11451",     /* switch-lanyplay-de    DE    */
-    "201.83.170.61:11451",     /* herbertfx.ddns.net    BR    */
+    "88.140.156.4:11451",
+    "192.241.238.136:11451",
+    "65.21.20.230:11451",
+    "45.83.241.140:11451",
+    "45.83.241.140:11453",
+    "91.195.240.12:11453",
+    "199.60.101.194:11451",
+    "199.60.101.194:11453",
+    "89.163.151.130:11451",
+    "37.187.111.226:11451",
+    "185.117.82.250:11451",
+    "37.201.39.187:11451",
+    "201.83.170.61:11451",
+};
+static const char *g_seed_labels[] = {
+    "switch.lan-play.com  EU FR",
+    "tekn0.net            EU",
+    "lan.nonny.horse      EU",
+    "switch.jayseateam.nl NL",
+    "switch.jayseateam.nl NL :11453",
+    "switch.0mn1b0x.com   AU",
+    "joinsg.net           US",
+    "joinsg.net           US :11453",
+    "switch.servegame.com DK",
+    "spain-slp.duckdns.org FR",
+    "games.initlab.org    BG",
+    "switch-lanyplay-de   DE",
+    "herbertfx.ddns.net   BR",
 };
 #define SEED_COUNT (int)(sizeof(g_seed_relays)/sizeof(g_seed_relays[0]))
 
@@ -58,31 +73,53 @@ static const char *g_seed_relays[] = {
 /*  Relay list helpers                                                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 typedef struct {
-    char entries[MAX_RELAYS][64];
+    char entries[MAX_RELAYS][64];   /* IP:PORT */
+    char labels[MAX_RELAYS][48];    /* display name, may be empty */
     int  count;
 } RelayList;
 
-/* Load relays.txt into rl. If file is missing, seed with known IPs. */
+/* Load relays.txt into rl. If file is missing, seed with known IPs.
+ * File format: IP:PORT  (optional: # label text)                      */
 static void relaylist_load(RelayList *rl)
 {
     rl->count = 0;
     FILE *f = fopen(RELAYS_PATH, "r");
     if (f) {
-        char line[64];
+        char line[128];
         while (rl->count < MAX_RELAYS && fgets(line, sizeof(line), f)) {
             /* strip newline */
             int len = (int)strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
-            if (len > 0)
+            if (len == 0) continue;
+            /* split on '#' to get optional label */
+            char *hash = strchr(line, '#');
+            if (hash) {
+                *hash = '\0';
+                /* trim trailing whitespace from IP part */
+                int iplen = (int)strlen(line);
+                while (iplen > 0 && (line[iplen-1] == ' ' || line[iplen-1] == '\t'))
+                    line[--iplen] = '\0';
+                /* trim leading whitespace from label */
+                const char *lbl = hash + 1;
+                while (*lbl == ' ' || *lbl == '\t') lbl++;
+                strncpy(rl->labels[rl->count], lbl, 47);
+                rl->labels[rl->count][47] = '\0';
+            } else {
+                rl->labels[rl->count][0] = '\0';
+            }
+            if (line[0])
                 strncpy(rl->entries[rl->count++], line, 63);
         }
         fclose(f);
     }
     /* If empty, seed with known IPs */
     if (rl->count == 0) {
-        for (int i = 0; i < SEED_COUNT && rl->count < MAX_RELAYS; i++)
-            strncpy(rl->entries[rl->count++], g_seed_relays[i], 63);
+        for (int i = 0; i < SEED_COUNT && rl->count < MAX_RELAYS; i++) {
+            strncpy(rl->entries[rl->count], g_seed_relays[i], 63);
+            strncpy(rl->labels[rl->count], g_seed_labels[i], 47);
+            rl->count++;
+        }
     }
 }
 
@@ -93,8 +130,12 @@ static void relaylist_save(const RelayList *rl)
     mkdir(CONFIG_DIR, 0777);
     FILE *f = fopen(RELAYS_PATH, "w");
     if (!f) return;
-    for (int i = 0; i < rl->count; i++)
-        fprintf(f, "%s\n", rl->entries[i]);
+    for (int i = 0; i < rl->count; i++) {
+        if (rl->labels[i][0])
+            fprintf(f, "%s  # %s\n", rl->entries[i], rl->labels[i]);
+        else
+            fprintf(f, "%s\n", rl->entries[i]);
+    }
     fclose(f);
     commit_sdmc();
 }
@@ -105,17 +146,24 @@ static void relaylist_add(RelayList *rl, const char *ip_port)
     /* Remove if already present */
     for (int i = 0; i < rl->count; i++) {
         if (strcmp(rl->entries[i], ip_port) == 0) {
-            /* Move to top */
+            /* Move to top (preserve label) */
+            char saved_label[48];
+            strncpy(saved_label, rl->labels[i], 47);
+            saved_label[47] = '\0';
             memmove(rl->entries[1], rl->entries[0], i * sizeof(rl->entries[0]));
+            memmove(rl->labels[1],  rl->labels[0],  i * sizeof(rl->labels[0]));
             strncpy(rl->entries[0], ip_port, 63);
+            strncpy(rl->labels[0],  saved_label, 47);
             relaylist_save(rl);
             return;
         }
     }
-    /* Not present: insert at top, evict oldest if full */
+    /* Not present: insert at top with empty label, evict oldest if full */
     int keep = rl->count < MAX_RELAYS ? rl->count : MAX_RELAYS - 1;
     memmove(rl->entries[1], rl->entries[0], keep * sizeof(rl->entries[0]));
+    memmove(rl->labels[1],  rl->labels[0],  keep * sizeof(rl->labels[0]));
     strncpy(rl->entries[0], ip_port, 63);
+    rl->labels[0][0] = '\0';
     rl->count = keep + 1;
     relaylist_save(rl);
 }
@@ -958,9 +1006,13 @@ static bool list_screen(RelayList *rl, const char *current,
                 draw_outline(LIST_LEFT, ry, LIST_W, LIST_ITEM_H,
                              RGBA8_MAXALPHA(0, 220, 255), 2);
 
-            u32 tc = is_sel ? RGBA8_MAXALPHA(0,0,0) : C_TXT;
-            draw_text(LIST_LEFT + 16, ry + (LIST_ITEM_H - 24)/2,
-                      rl->entries[idx], tc, 3);
+            u32 tc  = is_sel ? RGBA8_MAXALPHA(0,0,0) : C_TXT;
+            u32 lc  = is_sel ? RGBA8_MAXALPHA(0,0,0) : C_TXT_DIM;
+            bool has_label = rl->labels[idx][0] != '\0';
+            int ip_y = has_label ? ry + 8 : ry + (LIST_ITEM_H - 24) / 2;
+            draw_text(LIST_LEFT + 16, ip_y, rl->entries[idx], tc, 3);
+            if (has_label)
+                draw_text(LIST_LEFT + 16, ry + 36, rl->labels[idx], lc, 2);
 
             if (is_cur) {
                 const char *tag = "[activo]";

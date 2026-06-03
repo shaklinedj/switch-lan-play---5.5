@@ -26,7 +26,7 @@ ROMFS       :=
 
 APP_TITLE   := LanPlay Setup
 APP_AUTHOR  := switch-lan-play
-APP_VERSION := 1.6
+APP_VERSION := 1.7
 
 ICON := icon.jpg
 
