@@ -9,6 +9,8 @@ on:
 jobs:
   build-nro:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     container:
       image: devkitpro/devkita64:latest
 
